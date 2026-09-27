@@ -14,8 +14,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-
 
 class AskRequest(BaseModel):
     question: str
@@ -135,8 +133,12 @@ async def upload_and_ask(
         if len(content) == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="File size exceeds the 10MB limit.")
+        max_file_size = get_settings().max_file_size
+        if len(content) > max_file_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size exceeds the {max_file_size // (1024 * 1024)}MB limit."
+            )
 
         # Generate a unique ID upfront so the filename and session_id match from the start
         session_id = str(uuid4())

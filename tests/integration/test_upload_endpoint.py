@@ -200,20 +200,23 @@ def test_session_id_takes_priority_over_file(api_client, tmp_data_dir, sample_cs
 
 
 def test_oversized_file_rejected(api_client, tmp_data_dir, monkeypatch):
-    """Exercises the 10MB MAX_FILE_SIZE guard in routes/ask.py without
-    actually uploading 10MB — monkeypatches the limit down to a few bytes
-    for this test only."""
-    from src.routes import ask as ask_route
-    monkeypatch.setattr(ask_route, "MAX_FILE_SIZE", 5)
-
-    response = api_client.post(
-        "/upload",
-        data={"question": "Anything"},
-        files={"file": ("sample_data.csv", b"date,revenue\n2024-01-01,100\n", "text/csv")},
-    )
+    """Exercises the Settings.max_file_size guard in routes/ask.py without
+    actually uploading 10MB — overrides the limit down to a few bytes via
+    the MAX_FILE_SIZE env var for this test only."""
+    from src.config import get_settings
+    monkeypatch.setenv("MAX_FILE_SIZE", "5")
+    get_settings.cache_clear()
+    try:
+        response = api_client.post(
+            "/upload",
+            data={"question": "Anything"},
+            files={"file": ("sample_data.csv", b"date,revenue\n2024-01-01,100\n", "text/csv")},
+        )
+    finally:
+        get_settings.cache_clear()
 
     assert response.status_code == 400
-    assert "10MB" in response.json()["detail"] or "size" in response.json()["detail"].lower()
+    assert "size" in response.json()["detail"].lower()
 
 
 class _PromptSpyClient(FakeGroqClient):

@@ -13,8 +13,6 @@ logger = logging.getLogger(__name__)
 _sessions: dict = {}
 _lock = threading.Lock()  # prevents race conditions when multiple requests hit at once
 
-SESSION_TTL_MINUTES = 30
-
 
 def _safe_remove(path: str) -> bool:
     """Delete a file, tolerating Windows file locks instead of crashing the
@@ -73,7 +71,7 @@ def get_session(session_id: str) -> dict | None:
             return None
         # Check if session has expired
         age = datetime.now() - session["last_accessed"]
-        if age > timedelta(minutes=SESSION_TTL_MINUTES):
+        if age > timedelta(minutes=get_settings().session_ttl_minutes):
             logger.info(f"Session expired on access: {session_id}")
             _delete_session_files(session_id, session)
             del _sessions[session_id]
@@ -85,11 +83,12 @@ def get_session(session_id: str) -> dict | None:
 def cleanup_expired_sessions() -> None:
     """Delete all sessions whose last_accessed time exceeds the TTL. Called by background task."""
     now = datetime.now()
+    ttl = timedelta(minutes=get_settings().session_ttl_minutes)
     expired = []
     with _lock:
         for session_id, session in _sessions.items():
             age = now - session["last_accessed"]
-            if age > timedelta(minutes=SESSION_TTL_MINUTES):
+            if age > ttl:
                 expired.append((session_id, session))
         for session_id, session in expired:
             _delete_session_files(session_id, session)
