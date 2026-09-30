@@ -56,9 +56,10 @@ locked architectural decisions.
 source venv/Scripts/activate
 ```
 
-3. Install dependencies
+3. Install dependencies (this pulls in `requirements.txt` too, plus pytest/ruff for
+   running the test suite below — the deployed image installs only `requirements.txt`)
 ```
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
 4. Create a `.env` file and add your Groq API key

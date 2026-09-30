@@ -22,9 +22,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        # requirements-dev.txt pulls in requirements.txt plus pytest/ruff/
+        # coverage — the Docker image built in a later step installs only
+        # requirements.txt, so this is where test/lint tooling stays scoped
+        # to CI and local dev.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Lint with ruff
         run: ruff check .

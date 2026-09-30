@@ -45,9 +45,23 @@ cut — still on `claude/v6.2-ci` as of this writing)
 **Setup**
 ```bash
 source venv/Scripts/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt  # pulls in requirements.txt too, plus pytest/ruff
 # Create .env with: GROQ_API_KEY=your_key_here
 ```
+(Phase 5 follow-up: `requirements.txt` is runtime-only now — the Docker image installs just
+that file. `requirements-dev.txt` adds pytest/pytest-cov/pytest-mock/coverage/ruff/requests for
+local dev and CI. Dropped `openai` and its dependency `jiter`, since nothing imports the
+`openai` package anywhere in this repo — confirmed via `pip show`'s `Required-by:` before
+removing. `typer`/`rich`/`shellingham` were removed on the same basis, then added back after a
+fresh-venv install (see below) revealed they're real, needed dependencies after all —
+`tokenizers` requires `huggingface-hub`, which in turn requires `typer` for its own CLI.
+`requirements.txt` is now fully verified against a from-scratch `pip install`, not just
+`pip show` on an already-populated venv, which is what caught this: the old venv had drifted
+into a state where `huggingface-hub` was silently missing despite `tokenizers` declaring it as
+required — `pip check` flagged this as an inconsistency, but the app still worked, since our
+own code only calls `Tokenizer.from_file()`, never the part of `tokenizers` that needs the Hub
+client. A truly fresh install — which is what CI and the Docker build both do — doesn't get to
+rely on that kind of drift, so `requirements.txt` needed `huggingface-hub` added explicitly.)
 
 **Run the server**
 ```bash
