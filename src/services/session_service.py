@@ -59,8 +59,22 @@ def create_session(session_id: str, file_path: str, original_filename: str) -> N
             "original_filename": original_filename,
             "created_at": datetime.now(),
             "last_accessed": datetime.now(),
+            "chart_paths": [],
         }
     logger.info(f"Session created: {session_id} | file: {original_filename}")
+
+
+def register_chart(session_id: str, chart_path: str) -> None:
+    """Record a chart file this session generated, so its cleanup path
+    below can delete it later — chart files are never deleted otherwise
+    (see docs/BUGS_FOUND.md), which is a slow memory leak now that Cloud
+    Run's filesystem lives in RAM. No-op if the session isn't tracked (e.g.
+    /ask's auto-generated session_id, which was never registered via
+    create_session either)."""
+    with _lock:
+        session = _sessions.get(session_id)
+        if session is not None:
+            session.setdefault("chart_paths", []).append(chart_path)
 
 
 def get_session(session_id: str) -> dict | None:
@@ -99,12 +113,20 @@ def cleanup_expired_sessions() -> None:
 
 
 def _delete_session_files(session_id: str, session: dict) -> None:
-    """Delete the uploaded CSV and any generated DB files for this session."""
+    """Delete the uploaded CSV, any generated chart PNGs, and any generated
+    DB files for this session."""
     # Delete uploaded CSV
     file_path = session.get("file_path", "")
     if file_path and os.path.exists(file_path):
         if _safe_remove(file_path):
             logger.info(f"Deleted session file: {file_path}")
+
+    # Delete this session's chart PNGs (see register_chart) — chart
+    # filenames are random UUIDs, not session_id-derived, so this list is
+    # the only way cleanup can find them again.
+    for chart_path in session.get("chart_paths", []):
+        if os.path.exists(chart_path) and _safe_remove(chart_path):
+            logger.info(f"Deleted session chart: {chart_path}")
 
     # Delete any generated DB files for this session (pattern: data/{session_id}_*.db)
     for db_file in glob.glob(f"{get_settings().db_dir}/{session_id}_*.db"):

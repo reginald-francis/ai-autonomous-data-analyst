@@ -114,6 +114,17 @@ def test_chart_question_returns_chart_path(api_client, tmp_data_dir, sample_csv_
     assert body["chart_path"] is not None
     assert "chart" in body["agents_used"]
 
+    # chart_path is a server-local filesystem path, useless to a remote
+    # caller — chart_url is the fetchable equivalent (main.py's /charts
+    # static mount), and must not leak session_id into the URL.
+    assert body["chart_url"] is not None
+    assert body["chart_url"].startswith("/charts/")
+    assert body["session_id"] not in body["chart_url"]
+
+    chart_response = api_client.get(body["chart_url"])
+    assert chart_response.status_code == 200
+    assert chart_response.headers["content-type"] == "image/png"
+
 
 def test_non_csv_file_rejected(api_client, tmp_data_dir):
     response = api_client.post(

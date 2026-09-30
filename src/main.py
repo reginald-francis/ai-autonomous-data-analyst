@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 import logging
@@ -66,6 +67,20 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 app.include_router(ask_router)
+
+# Serves generated chart PNGs at GET /charts/{filename} — needed so a remote
+# caller (anything other than someone with filesystem access to the server)
+# can actually fetch the chart_url an /upload response returns. check_dir=
+# False because charts_dir is only created a moment later, in lifespan();
+# StaticFiles would otherwise raise at import time if the folder doesn't
+# exist yet. File names are random UUIDs (see chart_agent.py), never
+# session_id, so this route can't be used to guess or enumerate another
+# session's chart — see docs/THREAT_MODEL.md.
+app.mount(
+    "/charts",
+    StaticFiles(directory=get_settings().charts_dir, check_dir=False),
+    name="charts",
+)
 
 @app.get("/")
 def root():

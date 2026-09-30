@@ -11,6 +11,7 @@ from src.agents.planner_agent import PlannerAgent
 from src.agents.python_agent import PythonAgent
 from src.agents.sql_agent import SQLAgent
 from src.agents.chart_agent import ChartAgent
+from src.services.session_service import register_chart
 from src.utils.schemas import AnalysisResponse
 
 
@@ -108,6 +109,7 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
 
     result = None
     chart_path = None
+    chart_url = None
     agents_used = []
     model_used = DEFAULT_MODEL
 
@@ -139,6 +141,10 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
             logger.info("Routing to Chart agent")
             chart_path = chart_agent.run(question, result, file_path, complexity, session_id=session_id, data_context=data_context)
             agents_used.append("chart")
+            # chart_path is a server-local filesystem path — chart_url is
+            # the fetchable equivalent, served by main.py's /charts mount.
+            chart_url = f"/charts/{os.path.basename(chart_path)}"
+            register_chart(session_id, chart_path)
 
     except Exception as e:
         logger.error(f"Agent execution failed: {str(e)}")
@@ -159,6 +165,7 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
             reasoning=reasoning,
             complexity=complexity,
             chart_path=chart_path,
+            chart_url=chart_url,
             session_id=session_id
         )
 
@@ -181,5 +188,6 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
         reasoning=reasoning,
         complexity=complexity,
         chart_path=chart_path,
+        chart_url=chart_url,
         session_id=session_id
     )

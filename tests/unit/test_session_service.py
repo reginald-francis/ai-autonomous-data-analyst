@@ -125,6 +125,25 @@ def test_delete_session_files_removes_uploaded_csv(tmp_data_dir):
     assert not csv_path.exists()
 
 
+def test_register_chart_then_delete_session_files_removes_it(tmp_data_dir):
+    chart_path = tmp_data_dir / "data" / "charts" / "9f3c1e2a.png"
+    chart_path.write_text("")
+
+    session_service.create_session("s1", "data/uploads/s1.csv", "sample_data.csv")
+    session_service.register_chart("s1", str(chart_path))
+
+    session = session_service._sessions["s1"]
+    session_service._delete_session_files("s1", session)
+
+    assert not chart_path.exists()
+
+
+def test_register_chart_is_a_noop_for_unknown_session():
+    """/ask's auto-generated session_id is never registered via
+    create_session — register_chart must not raise for it."""
+    session_service.register_chart("never-created", "data/charts/whatever.png")
+
+
 def test_delete_session_files_removes_matching_db_files(tmp_data_dir):
     (tmp_data_dir / "data" / "s1_sample_data.db").write_text("")
     (tmp_data_dir / "data" / "other_session_sample_data.db").write_text("")

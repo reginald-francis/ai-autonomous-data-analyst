@@ -120,6 +120,34 @@ config (Phase 5, Docker half) is expected to carry:
   the timeout discussion above for why this cap also means one hung request costs proportionally
   more.
 
+## Chart URL exposure (outside this doc's original exec() scope, added Phase 5 follow-up)
+
+`main.py` serves generated chart PNGs at `GET /charts/{filename}` so a remote caller (not just
+someone with filesystem access to the server) can actually see a chart an `/upload` response
+points to via `chart_url`.
+
+**The risk this created:** the file naming this replaced used the requesting session's
+`session_id` as the chart's filename. Once that file is reachable at a URL, the URL itself
+becomes a leak: `session_id` is the caller's only credential for its session's uploaded CSV and
+follow-up questions (see `PHASES.md`'s SaaS-readiness discussion — sessions have no other
+auth). Anyone who saw a `session_id`-derived chart URL — in a shared link, a browser history, or
+Cloud Run's request logs — could replay that `session_id` against `/upload` and read the
+session's actual data, not just view the one chart that was meant to be shared.
+
+**Fix:** chart filenames are a fresh, unrelated random UUID (`uuid4().hex`) per chart, generated
+in `chart_agent.py`, never derived from `session_id` or from the question/title. A name built
+from the question text was considered and rejected: two different sessions asking a
+similarly-worded question would collide (last write wins — one session could end up seeing
+another session's chart), and a name predictable from common question phrasing is partially
+guessable, defeating the point of an unguessable link. `session_service.register_chart()`
+tracks each session's chart paths separately so they can still be deleted when the session
+expires, since the filename itself no longer encodes anything to search by.
+
+**What this does not fix:** the chart URL, once generated, has no expiry and no access check of
+its own — anyone sent a specific chart link can view that one image indefinitely (until the
+session's TTL cleanup deletes the file). This is an accepted tradeoff for a demo with no auth
+layer, consistent with the "no SaaS, no login" locked decision in `PHASES.md`.
+
 ## Bottom line
 
 This is defense-in-depth against the known, common attack shapes (direct dangerous-builtin
