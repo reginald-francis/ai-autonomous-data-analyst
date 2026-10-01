@@ -126,6 +126,33 @@ def test_chart_question_returns_chart_path(api_client, tmp_data_dir, sample_csv_
     assert chart_response.headers["content-type"] == "image/png"
 
 
+def test_chart_url_is_absolute_when_public_base_url_is_set(api_client, tmp_data_dir, sample_csv_path, monkeypatch):
+    """Settings.public_base_url (e.g. the deployed Cloud Run URL) makes
+    chart_url directly usable by a remote caller — an <img src> or a
+    shared link — without the caller having to know/prepend the server's
+    own base URL itself."""
+    from src.config import get_settings
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://agent-example.us-central1.run.app")
+    get_settings.cache_clear()
+    try:
+        fake_client = FakeGroqClient(
+            plan={"task_type": "visualization", "agents": ["python", "chart"], "reasoning": "bar chart"},
+        )
+        with _with_fake_client(fake_client):
+            with open(sample_csv_path, "rb") as f:
+                response = api_client.post(
+                    "/upload",
+                    data={"question": "Show me a bar chart of revenue by product"},
+                    files={"file": ("sample_data.csv", f, "text/csv")},
+                )
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 200
+    chart_url = response.json()["chart_url"]
+    assert chart_url.startswith("https://agent-example.us-central1.run.app/charts/")
+
+
 def test_non_csv_file_rejected(api_client, tmp_data_dir):
     response = api_client.post(
         "/upload",

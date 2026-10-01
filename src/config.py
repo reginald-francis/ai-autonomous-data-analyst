@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     max_file_size: int = 10 * 1024 * 1024  # 10MB
     max_context_doc_size: int = 2 * 1024 * 1024  # 2MB — business-context text/markdown doc
 
+    # --- Public URL (optional) ---
+    # Empty by default — local dev, CI, and tests all leave this unset, so
+    # chart_url (see analyst_service.py) stays a relative path exactly as
+    # before. Set to the deployed Cloud Run URL (e.g. via `gcloud run
+    # deploy --update-env-vars PUBLIC_BASE_URL=https://...`) to make
+    # chart_url an absolute, directly-fetchable link instead — lets a
+    # caller use it as-is (an <img src>, a shared link) without having to
+    # know or prepend the server's own base URL itself.
+    public_base_url: str = ""
+
     # --- Paths ---
     data_dir: str = "data"
     uploads_dir: str = "data/uploads"

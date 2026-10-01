@@ -34,6 +34,7 @@ def test_defaults_load_without_env_file(monkeypatch, tmp_path):
     assert settings.charts_dir == "data/charts"
     assert settings.embedding_model == "all-MiniLM-L6-v2"
     assert settings.embedding_model_path == "models/all-MiniLM-L6-v2-onnx"
+    assert settings.public_base_url == ""
 
 
 def test_env_var_overrides_default(monkeypatch, tmp_path):
