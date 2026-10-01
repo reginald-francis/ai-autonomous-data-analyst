@@ -1,6 +1,6 @@
 # Autonomous Data Analyst
 
-[![CI](https://github.com/Reginald-William/ai-autonomous-data-analyst/actions/workflows/ci.yml/badge.svg)](https://github.com/Reginald-William/ai-autonomous-data-analyst/actions/workflows/ci.yml)
+[![CI](https://github.com/reginald-francis/ai-autonomous-data-analyst/actions/workflows/ci.yml/badge.svg)](https://github.com/reginald-francis/ai-autonomous-data-analyst/actions/workflows/ci.yml)
 
 A data platform with an AI agent as its serving layer. A public dataset is ingested on a
 schedule, landed in raw storage, modeled through dbt into a warehouse, and checked for data
@@ -24,20 +24,28 @@ SQL querying, chart generation, and structured responses.
 - Retries automatically if generated code fails, with a complexity-scaled retry budget
 - Returns structured responses with full metadata
 
+## Live Demo
+
+`https://agent-1079929934435.us-central1.run.app` — deployed on Cloud Run (see `PHASES.md`
+Phase 5). Scales to zero when idle, so the first request after a quiet period may take a few
+extra seconds (cold start).
+
 ## Tech Stack
 - Python, FastAPI
 - Groq (LLM provider) — `openai/gpt-oss-20b` (fast/cheap) and `openai/gpt-oss-120b`
   (strongest), dynamically routed by question complexity
 - Pandas, SQLite
-- FAISS, Sentence Transformers — per-session RAG (Phase 4b) over an optional user-uploaded
-  business-context document; the original static `docs/` corpus was removed in Phase 4 once it
-  turned out redundant with hardcoded prompt rules (see `PHASES.md` Phase 4)
+- FAISS, onnxruntime + tokenizers (quantized ONNX embeddings — see `PHASES.md` Phase 5) —
+  per-session RAG (Phase 4b) over an optional user-uploaded business-context document; the
+  original static `docs/` corpus was removed in Phase 4 once it turned out redundant with
+  hardcoded prompt rules (see `PHASES.md` Phase 4)
 - Matplotlib, Tabulate
 - pydantic-settings — centralized config (Phase 2)
-- pytest — 170+ automated tests as of Phase 4b (see `PHASES.md`)
+- pytest — 200+ automated tests as of Phase 5 (see `PHASES.md`)
 - ruff (lint) + GitHub Actions CI — matrix Python 3.11/3.13 (Phase 3)
+- Docker + Google Cloud Run — deployed, Phase 5 (see Live Demo above)
 
-Planned as the platform builds out: Docker, dbt, BigQuery, Airflow, Great Expectations,
+Planned as the platform builds out: dbt, BigQuery, Airflow, Great Expectations,
 LangGraph, Streamlit. See [`PHASES.md`](PHASES.md) for the full plan.
 
 ## Project Phases
@@ -119,8 +127,9 @@ same session without needing to be re-uploaded, and never affects any other sess
 Sessions expire after 30 minutes of inactivity.
 
 ### POST /ask
-Ask a question using a local file path. Kept for development and local testing — not exposed
-publicly until the path-traversal fix in `PHASES.md` Phase 5 lands.
+Ask a question using a local file path. Kept for development and local testing — disabled by
+default (`Settings.enable_ask_endpoint`); the path-traversal fix landed in Phase 5
+(see `PHASES.md`).
 
 ```bash
 curl -X POST http://localhost:8000/ask \
@@ -146,6 +155,7 @@ curl -X POST http://localhost:8000/ask \
     "reasoning": "question asks for calculation so python agent is used",
     "complexity": "low",
     "chart_path": null,
+    "chart_url": null,
     "session_id": "7455452f-f6be-4770-93d9-f24186779432"
 }
 ```
@@ -194,12 +204,15 @@ POST /ask (JSON: file_path + question)  ← local dev/testing only
                   low         → openai/gpt-oss-20b
                   medium/high → openai/gpt-oss-120b
                   Complexity also scales retry budget (2/3/5 attempts)
-                  Artifacts named with session_id (charts + DBs)
+                  DB files named with session_id; chart PNGs get a random
+                  UUID filename instead, served at /charts/{uuid}.png
+                  (session_id-named charts would leak a session's access
+                  credential into a shared/logged URL — see THREAT_MODEL.md)
                                         │
                                         ↓
                                  AnalysisResponse
                           (result, status, attempts, model_used,
-                           agents_used, chart_path, session_id, ...)
+                           agents_used, chart_path, chart_url, session_id, ...)
 ```
 
 Once the data platform lands (see `PHASES.md`), a second path queries a BigQuery warehouse

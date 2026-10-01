@@ -4,8 +4,8 @@
 scoped to roughly one weekend at ~10 hrs/week, has its own branch, and ends mergeable. Work
 **one phase per chat session** — read this file first to find the current phase.
 
-**Last updated:** 2026-09-17 · **Current phase:** 5 in progress (security + ONNX swap done,
-Docker/Cloud Run deploy remaining) · **Branch:** `claude/v7-deploy`
+**Last updated:** 2026-10-01 · **Current phase:** 6 — Ingestion, not yet started ·
+**Branch:** `claude/v8-ingestion` (not yet cut)
 
 ---
 
@@ -56,7 +56,7 @@ testing?"
 | 3 | API + integration tests, CI | `claude/v6.2-ci` | 1 | Sep 2026 | ✅ Done |
 | 4 | Dynamic data context | `claude/v6.3-data-context` | 1 | Sep 2026 | ✅ Done |
 | 4b | User-supplied RAG context | `claude/v6.4-rag-context` | 1 | Sep 2026 | ✅ Done |
-| 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | 🟨 |
+| 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | ✅ |
 | 6 | Ingestion: source TBD → Parquet | `claude/v8-ingestion` | 1 | Oct 2026 | ⬜ |
 | 7 | dbt + BigQuery: staging → marts | `claude/v9-dbt-bigquery` | 2 | Oct 2026 | ⬜ |
 | 8 | Data-source abstraction; agent reads marts | `claude/v10-warehouse-serving` | 2 | Nov 2026 | ⬜ |
@@ -503,7 +503,7 @@ session that doesn't upload one behaves exactly as before (no regression, no req
 
 ---
 
-## Phase 5 — Docker + Cloud Run + security 🟨 (in progress)
+## Phase 5 — Docker + Cloud Run + security ✅
 
 **Branch:** `claude/v7-deploy` · **2 weekends** — do not attempt in one
 
@@ -537,7 +537,7 @@ is <0.5 GB, not the <1.5 GB done-criterion below** — that number only guarante
 Remaining, deferred to Phase 13 (not blocking this phase — see `docs/BUGS_FOUND.md` #15-17):
 two more `chart_agent` bugs sharing the already-tracked root cause from findings #10-12.
 
-### The Docker size problem ✅ embedding swap done, Dockerfile/deploy not started
+### The Docker size problem ✅ resolved — embedding swap, then the actual Dockerfile/deploy in Weekend 2 below
 
 `torch` + `sentence-transformers` + `faiss-cpu` was ~2.5 GB installed; a naive image was
 ~3.5 GB. Artifact Registry's free tier is **0.5 GB** (see the zero-cost mandate above).
@@ -568,12 +568,43 @@ one genuinely-related pair tested stayed at an identical 0.760 in both models. V
 against the real Groq API afterward (the "senior employee" glossary scenario from finding #13).
 `requirements.txt` dropped from 79 to 65 packages.
 
-**Not yet done:** `.dockerignore`, the Dockerfile itself, resolving the chart-image-serving gap
-(chart_path returns a local filesystem path with no way for a remote caller to fetch it —
-decided: mount a static `/charts/{filename}` route, not base64), the session-per-instance
-limitation under Cloud Run's multi-instance model (mitigate with `max-instances=1`), GCP
-project/API setup (personal project, confirmed never Intuit's org), and the actual build/push/
-deploy.
+### Weekend 2 ✅ done (2026-10-01)
+
+Settings fixes (`SESSION_TTL_MINUTES`/`MAX_FILE_SIZE` were hardcoded, silently ignoring their
+`Settings` fields); the chart-image-serving gap resolved — `/charts/{uuid}.png` static route in
+`main.py`, a new `chart_url` field (`chart_path` kept for backward compat), chart filenames are
+random UUIDs rather than `session_id`-derived (closes a real access-credential leak — see
+`docs/THREAT_MODEL.md`'s "Chart URL exposure"), and charts are now deleted on session cleanup
+(previously never deleted — a slow memory leak on Cloud Run's in-memory filesystem);
+`requirements.txt` split into runtime-only + `requirements-dev.txt`, four genuinely-unused
+packages dropped (`openai`, `typer`, `rich`, `shellingham`) and one missing one added
+(`huggingface-hub`, a real `tokenizers` dependency a drifted local venv had silently gone
+without — only surfaced by testing a *genuinely fresh* install, not `pip show` on an
+already-populated venv); `Dockerfile` + `.dockerignore` + a CI `docker` job that builds, sizes,
+and smoke-tests `/health` on every push.
+
+**GCP setup and deploy, done 2026-10-01.** Project `autonomous-data-agent`, region
+`us-central1`, standard pay-as-you-go billing (no 90-day trial-expiry risk), $100 INR (~$1)
+budget alert. Artifact Registry repo `images`, Secret Manager secret `groq-api-key`, dedicated
+runtime service account `agent-runtime` scoped to `secretmanager.secretAccessor` on that one
+secret only. Deployed to Cloud Run (`--max-instances=1 --concurrency=1 --min-instances=0
+--memory=1Gi --allow-unauthenticated`).
+
+**Live URL: `https://agent-1079929934435.us-central1.run.app`.** All done-when checks passed:
+`/health` responds, `/upload` answers a real question, a chart question returns a working
+`chart_url`, `/ask` 404s. A `PUBLIC_BASE_URL` env var was added post-deploy so `chart_url`
+returns a full clickable link instead of a bare path. An Artifact Registry cleanup policy
+(keep the 2 most recent image versions) was applied, schema verified against Google's own docs
+rather than written from memory.
+
+**Image size result: 211 MB compressed, 599 MB uncompressed** — well under the 0.5 GB zero-cost
+target.
+
+**Accepted, not fixed:** an expired session's files (CSV, DB, chart PNGs) can sit for up to
+`TTL + 5 minutes` before deletion — `session_cleanup_loop()`'s periodic sweep is a separate
+path from the lazy delete-on-access, and nothing in this phase changed its 5-minute interval.
+Noted as a known, low-priority limitation, not a bug — revisit only if Cloud Run memory
+pressure becomes a real problem.
 
 **Done when:** public HTTPS URL answers a question; image <0.5 GB (revised from <1.5 GB per the
 zero-cost mandate); `/ask` rejects traversal (already true).

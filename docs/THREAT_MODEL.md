@@ -84,7 +84,7 @@ deliberately provides no `Thread.kill()`. A snippet genuinely stuck in a tight C
 - **On Cloud Run specifically:** the platform enforces its own request timeout (default 5 min,
   configurable up to 60 min) independent of anything in this codebase, and can replace an
   unresponsive container instance. That is a real backstop — but it operates on Cloud Run's
-  clock, not our 10-second one. Under the deploy's planned `max-instances=2` cap, a single
+  clock, not our 10-second one. Under the deploy's `max-instances=1` cap, a single
   genuinely-hung request can tie up half of total capacity for however long Cloud Run's own
   timeout takes to catch it, not just our 10 seconds. A second concurrent hung request could
   exhaust the other instance.
@@ -112,13 +112,20 @@ it isn't mistaken for something this phase caused.
 
 None of the above is a substitute for isolating the container itself. The Cloud Run deploy
 config (Phase 5, Docker half) is expected to carry:
-- **Read-only filesystem** — even if a snippet somehow got arbitrary file-write, there's nothing
-  writable to persist an attack in.
-- **No elevated service-account permissions** — a compromised container can't pivot into other
-  GCP resources.
-- **`max-instances=2`** — bounds the blast radius of any resource-exhaustion attempt, though see
-  the timeout discussion above for why this cap also means one hung request costs proportionally
-  more.
+- **A non-root container user** — `app`, created in the `Dockerfile`, owns only its own files;
+  no elevated OS permissions. (Cloud Run's filesystem is actually writable and held in memory —
+  not read-only, as an earlier draft of this doc assumed; see `PHASES.md` Phase 5's correction.
+  The non-root user is the real mitigation here, not filesystem immutability.)
+- **No elevated service-account permissions** — `agent-runtime`'s only IAM role is
+  `secretmanager.secretAccessor` on the one `groq-api-key` secret. A compromised container
+  can't pivot into Cloud Run itself, Artifact Registry, or anything else in the project.
+- **`max-instances=1`** (not 2 — revised once sessions were confirmed in-memory and
+  single-process by design) — bounds the blast radius of any resource-exhaustion attempt to the
+  one instance that will ever exist, though see the timeout discussion above for why this cap
+  also means one hung request costs proportionally more: there's no second instance to fall
+  back on.
+- **`concurrency=1`** — only one request processed at a time per instance, closing the
+  `sys.stdout` race documented in `docs/BUGS_FOUND.md` #3 for real at the deploy level.
 
 ## Chart URL exposure (outside this doc's original exec() scope, added Phase 5 follow-up)
 

@@ -13,6 +13,31 @@ intentionally left for a later phase, with which phase and why).
 
 ## Phase 5
 
+### 19. Chart files were never deleted, and follow-up charts silently overwrote earlier ones
+
+- **File:** `src/agents/chart_agent.py` (filename generation), `src/services/session_service.py`
+  (cleanup)
+- **Found by:** code review while designing Phase 5's chart-image-serving fix (making
+  `chart_path` fetchable over HTTP meant actually looking at how chart files were named and
+  cleaned up for the first time since the Phase 4 chart-spec redesign).
+- **What's wrong, two separate bugs:** (1) chart PNGs were named `{session_id}.png` — a second
+  chart question in the same session silently overwrote the first chart file on disk, with no
+  error and no indication anything was lost. (2) `session_service._delete_session_files()`
+  deleted a session's CSV and DB files on expiry, but never its chart PNG — chart files
+  accumulated forever, cleaned up only by the full startup orphan-sweep (i.e. never, on a
+  long-running deployed server that doesn't restart).
+- **Severity:** Medium — (1) is a silent data-loss bug for any session asking more than one
+  chart question; (2) is a slow memory leak, more significant on Cloud Run specifically since
+  its filesystem lives in instance RAM, not disk.
+- **Status:** `fixed` (Phase 5, Weekend 2) — chart filenames are now a fresh `uuid4().hex` per
+  chart, never derived from `session_id` (this also closed an unrelated security issue — see
+  `docs/THREAT_MODEL.md`'s "Chart URL exposure," since a session_id-named file became a real
+  credential leak once served over HTTP). `session_service.register_chart()` tracks each
+  session's chart paths so `_delete_session_files()` can delete them on the same TTL as the
+  CSV/DB files. Regression tests: `test_chart_filename_never_contains_session_id`,
+  `test_two_chart_runs_in_the_same_session_get_different_filenames`,
+  `test_register_chart_then_delete_session_files_removes_it`.
+
 ### 13. RAG context never reached the planner — a glossary term could get rejected as out-of-scope
 
 - **File:** `src/agents/planner_agent.py`, `PlannerAgent.run()`
