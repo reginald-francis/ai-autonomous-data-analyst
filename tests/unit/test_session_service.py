@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from src.config import get_settings
 from src.services import session_service
 
 
@@ -67,7 +68,7 @@ def test_get_session_expires_and_removes_old_session(monkeypatch, tmp_data_dir):
     session_service.create_session("s1", "data/uploads/s1.csv", "sample_data.csv")
 
     # Backdate last_accessed well past the TTL instead of sleeping for real.
-    too_old = datetime.now() - timedelta(minutes=session_service.SESSION_TTL_MINUTES + 5)
+    too_old = datetime.now() - timedelta(minutes=get_settings().session_ttl_minutes + 5)
     session_service._sessions["s1"]["last_accessed"] = too_old
 
     result = session_service.get_session("s1")
@@ -80,18 +81,32 @@ def test_get_session_within_ttl_is_not_expired():
     session_service.create_session("s1", "data/uploads/s1.csv", "sample_data.csv")
 
     just_under_ttl = datetime.now() - timedelta(
-        minutes=session_service.SESSION_TTL_MINUTES - 1
+        minutes=get_settings().session_ttl_minutes - 1
     )
     session_service._sessions["s1"]["last_accessed"] = just_under_ttl
 
     assert session_service.get_session("s1") is not None
 
 
+def test_session_ttl_env_override_is_honored(monkeypatch, tmp_data_dir):
+    """SESSION_TTL_MINUTES must actually change expiry behavior — the TTL
+    used to be a hardcoded module constant that silently ignored Settings."""
+    monkeypatch.setenv("SESSION_TTL_MINUTES", "1")
+    get_settings.cache_clear()
+    try:
+        session_service.create_session("s1", "data/uploads/s1.csv", "sample_data.csv")
+        session_service._sessions["s1"]["last_accessed"] = datetime.now() - timedelta(minutes=2)
+
+        assert session_service.get_session("s1") is None
+    finally:
+        get_settings.cache_clear()
+
+
 def test_cleanup_expired_sessions_removes_only_expired_ones():
     session_service.create_session("fresh", "data/uploads/fresh.csv", "fresh.csv")
     session_service.create_session("stale", "data/uploads/stale.csv", "stale.csv")
 
-    too_old = datetime.now() - timedelta(minutes=session_service.SESSION_TTL_MINUTES + 1)
+    too_old = datetime.now() - timedelta(minutes=get_settings().session_ttl_minutes + 1)
     session_service._sessions["stale"]["last_accessed"] = too_old
 
     session_service.cleanup_expired_sessions()
@@ -108,6 +123,25 @@ def test_delete_session_files_removes_uploaded_csv(tmp_data_dir):
     session_service._delete_session_files("s1", session)
 
     assert not csv_path.exists()
+
+
+def test_register_chart_then_delete_session_files_removes_it(tmp_data_dir):
+    chart_path = tmp_data_dir / "data" / "charts" / "9f3c1e2a.png"
+    chart_path.write_text("")
+
+    session_service.create_session("s1", "data/uploads/s1.csv", "sample_data.csv")
+    session_service.register_chart("s1", str(chart_path))
+
+    session = session_service._sessions["s1"]
+    session_service._delete_session_files("s1", session)
+
+    assert not chart_path.exists()
+
+
+def test_register_chart_is_a_noop_for_unknown_session():
+    """/ask's auto-generated session_id is never registered via
+    create_session — register_chart must not raise for it."""
+    session_service.register_chart("never-created", "data/charts/whatever.png")
 
 
 def test_delete_session_files_removes_matching_db_files(tmp_data_dir):

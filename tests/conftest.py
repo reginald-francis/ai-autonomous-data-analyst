@@ -166,8 +166,9 @@ def api_client():
 
     Routes work fine without it: rag_service.retrieve_session_context()
     already returns "" for any session with no uploaded context document
-    (see rag_service.py), which every agent prompt treats as just an empty
-    "Additional business context" section — not an error.
+    (see rag_service.py), and format_context_block() (Phase 5 follow-up)
+    turns that into "" too — no "Additional business context" section
+    appears in the prompt at all in that case, not an empty one.
     """
     return TestClient(app)
 

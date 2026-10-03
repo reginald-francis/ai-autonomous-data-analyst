@@ -15,7 +15,9 @@ Actions CI workflow. **Phase 4 (dynamic data context) is complete** — dataset-
 replaced the old TechMart-hardcoded RAG docs. **Phase 4b (user-supplied RAG context) is also
 complete** — RAG is now built per-session from an optional uploaded business-context document
 instead of a global `docs/` folder; see the RAG section below. **Phase 5 (Docker + Cloud Run +
-security) is next**, on branch `claude/v7-deploy`.
+security) is complete** — the app is deployed and live at
+`https://agent-1079929934435.us-central1.run.app`. See the Current State section below for
+details.
 
 **Project direction changed on 2026-08-24.** This repo is no longer heading toward a monetized
 SaaS product. It is now a **Data Engineering portfolio project**, targeting applications from
@@ -26,8 +28,9 @@ platform (ingestion → raw storage → dbt → BigQuery → data quality).
 13-phase plan, current status, locked decisions, risk register, and cost limits. Do not re-plan
 or re-litigate settled decisions.
 
-**Current phase:** 4 — Dynamic data context · **Branch:** `claude/v6.3-data-context` (not yet
-cut — still on `claude/v6.2-ci` as of this writing)
+**Current phase:** 6 — Ingestion · **Branch:** `claude/v8-ingestion` (not yet cut). The data
+source for ingestion isn't finalized — confirm with the owner before writing any code (see
+`PHASES.md` Phase 6).
 
 ## Working agreements
 
@@ -43,9 +46,23 @@ cut — still on `claude/v6.2-ci` as of this writing)
 **Setup**
 ```bash
 source venv/Scripts/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt  # pulls in requirements.txt too, plus pytest/ruff
 # Create .env with: GROQ_API_KEY=your_key_here
 ```
+(Phase 5 follow-up: `requirements.txt` is runtime-only now — the Docker image installs just
+that file. `requirements-dev.txt` adds pytest/pytest-cov/pytest-mock/coverage/ruff/requests for
+local dev and CI. Dropped `openai` and its dependency `jiter`, since nothing imports the
+`openai` package anywhere in this repo — confirmed via `pip show`'s `Required-by:` before
+removing. `typer`/`rich`/`shellingham` were removed on the same basis, then added back after a
+fresh-venv install (see below) revealed they're real, needed dependencies after all —
+`tokenizers` requires `huggingface-hub`, which in turn requires `typer` for its own CLI.
+`requirements.txt` is now fully verified against a from-scratch `pip install`, not just
+`pip show` on an already-populated venv, which is what caught this: the old venv had drifted
+into a state where `huggingface-hub` was silently missing despite `tokenizers` declaring it as
+required — `pip check` flagged this as an inconsistency, but the app still worked, since our
+own code only calls `Tokenizer.from_file()`, never the part of `tokenizers` that needs the Hub
+client. A truly fresh install — which is what CI and the Docker build both do — doesn't get to
+rely on that kind of drift, so `requirements.txt` needed `huggingface-hub` added explicitly.)
 
 **Run the server**
 ```bash
@@ -188,11 +205,18 @@ removed in Phase 4 once `data_context_service.py` made it redundant; see `PHASES
 complexity-tiering follow-up for why.) This keeps the two-call planner and the 500-row
 threshold meaningful.
 
-- Embeddings: `all-MiniLM-L6-v2` via sentence-transformers, loaded lazily on first RAG use —
-  originally Phase 2 (deferred from import time), now also the trigger point in practice for
-  Phase 4b: the first `/upload` in a process that includes a `context_file` pays this load
-  once; every session after that reuses the same loaded model instance. No index of any kind
-  is built at startup anymore (removed in Phase 4b along with the global `docs/` index).
+- Embeddings: `all-MiniLM-L6-v2`, quantized ONNX export (`models/all-MiniLM-L6-v2-onnx/`,
+  ~22MB, bundled into the image at build time — never downloaded at runtime), run via
+  `onnxruntime` + `tokenizers` instead of `sentence-transformers`/`torch`/`transformers`
+  (Phase 5 — see PHASES.md's Docker-size tradeoff). `rag_service.py`'s `OnnxEmbedder` hand-
+  implements the mean-pooling + L2-normalization `sentence-transformers` did internally;
+  quality-parity against the original model was verified in `scripts/validate_onnx_embedder.py`
+  and `scripts/validate_retrieval_threshold.py` — quantization shifts raw similarity values
+  slightly but changes zero retrieve/don't-retrieve decisions at this app's actual
+  `rag_distance_threshold`. Loaded lazily on first RAG use, same trigger point as before
+  (first `/upload` that includes a `context_file`); every session after that reuses the same
+  loaded instance. No index of any kind is built at startup (removed in Phase 4b along with
+  the global `docs/` index).
 - Environment: `GROQ_API_KEY` required in `.env`; the Groq client itself is constructed lazily
   on first use (Phase 2), not at import time
 - Groq free tier: 30 RPM, 1k RPD, **8K TPM**, 200k TPD — the TPM ceiling is tight against
@@ -216,22 +240,30 @@ threshold meaningful.
 Full ranked register with severities and owning phases is in `PHASES.md`. The ones most likely
 to bite while working in this codebase:
 
-- **All model IDs are dead** — nothing works until Phase 1a lands
-- **`exec()` of LLM-generated code is not sandboxed.** The dict named `safe_environment` in
-  `python_agent.py` and `chart_agent.py` is misleading — `exec` auto-injects `__builtins__`, so
-  `open`, `__import__`, and `os` are reachable. This is RCE if deployed publicly. Phase 5.
-- **`/ask` has a path-traversal hole** — caller-supplied `file_path`, unvalidated. Phase 5.
+- ~~**All model IDs are dead**~~ — **Fixed in Phase 1.** Remapped to `openai/gpt-oss-20b`/`120b`.
+- ~~**`exec()` of LLM-generated code is not sandboxed**~~ — **Fixed in Phase 5.**
+  `python_agent.execute_code()` is the only remaining `exec()` call site (`chart_agent.py`
+  stopped executing LLM-written code entirely in the Phase 4 redesign — the LLM only picks a
+  JSON chart spec now). Restricted `__builtins__`, an AST pre-check rejecting `import`
+  statements and dunder-attribute access, and a best-effort wall-clock timeout are documented
+  as defense-in-depth, not a hard guarantee, in `docs/THREAT_MODEL.md` — including the honest
+  gap that a thread-based timeout can't forcibly reclaim a hung snippet's CPU/memory the way a
+  subprocess kill could (noted there as a near-term follow-up).
+- ~~**`/ask` has a path-traversal hole**~~ — **Fixed in Phase 5.** `file_path` is resolved
+  against the project root and any escape is rejected (403); the endpoint itself is also
+  disabled by default (`Settings.enable_ask_endpoint`), so a deployed instance never exposes it
+  without an explicit opt-in.
 - ~~**Import-time side effects**~~ — **Fixed in Phase 2.** `llm_service.get_llm_client()` is now
   lazy (`@lru_cache`), `rag_service`'s `SentenceTransformer`/`faiss` load on first RAG use via a
   `RagIndex` class, and `analyst_service.build_agents()` replaces the four import-time agent
   singletons. `python -c "import src.main"` builds no client and loads no transformer.
-- **SQLite connections aren't in try-finally** — the cause of Windows `PermissionError` during
-  session cleanup. Phase 1b.
+- ~~**SQLite connections aren't in try-finally**~~ — **Fixed in Phase 1b.**
+  `database_service.py`/`sql_agent.py` wrap connections in `contextlib.closing`.
 - **7 redundant `pd.read_csv` calls** — one request can read the same file up to 6 times.
 - **The pipeline is file-path-shaped.** `python_agent` assumes one in-memory dataframe, which
   breaks at warehouse scale. This is the deepest change ahead — Phase 8.
 
-## Current State (Phase 4b complete, Phase 5 next)
+## Current State (Phase 5 complete and deployed, Phase 6 next)
 
 V5 file upload merged to `main` via PR #3 (`3a07c1f`). `POST /upload` accepts CSVs via
 multipart/form-data, saved to `data/uploads/{session_id}.csv`, with a 30-minute session TTL so
@@ -293,7 +325,12 @@ loads lazily on the first `/upload` that actually includes a context document. 8
 session isolation, and the new upload's validation (non-UTF-8, empty, oversized, duplicate
 field) — 170 total tests, 91% coverage.
 
-**Phase 5 (Docker + Cloud Run + security) is next**, on branch `claude/v7-deploy`. Per Phase
-4b's resolution of the Docker-size tradeoff (see `PHASES.md` Phase 5), RAG stays real rather
-than being removed — the fix there is swapping `sentence-transformers`+`torch` for ONNX
-embeddings (~90 MB), not dropping retrieval.
+**Phase 5 (Docker + Cloud Run + security), on branch `claude/v7-deploy`, is complete.**
+Weekend 1 (security): the `/ask` path-traversal hole is fixed and the endpoint is disabled by
+default; `python_agent.execute_code()`'s `exec()` is sandboxed; the `sentence-transformers`+
+`torch` → ONNX embedding swap landed. Weekend 2: the chart-image-serving gap closed
+(`/charts/{uuid}.png` static route, `chart_url` field, UUID filenames that can't leak
+`session_id`, chart cleanup on session expiry); `requirements.txt`/`requirements-dev.txt`
+split; `Dockerfile` + CI `docker` job; and the actual GCP deploy. **Live at
+`https://agent-1079929934435.us-central1.run.app`**, image 211 MB compressed. Full writeup
+in `PHASES.md` Phase 5.

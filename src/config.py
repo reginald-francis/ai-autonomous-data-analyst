@@ -45,17 +45,46 @@ class Settings(BaseSettings):
     # --- Sessions ---
     session_ttl_minutes: int = 30
 
+    # --- /ask endpoint ---
+    # /ask takes a caller-supplied file_path with no auth — fine for local
+    # dev/testing (see routes/ask.py's docstring), a live arbitrary-file-read
+    # risk on a public URL (see PHASES.md risk #3, confirmed live in Phase 3).
+    # Off by default so a deployed instance doesn't expose it without an
+    # explicit opt-in; the path-traversal allowlist in routes/ask.py applies
+    # regardless of this flag, as defense in depth.
+    enable_ask_endpoint: bool = False
+
     # --- Uploads ---
     max_file_size: int = 10 * 1024 * 1024  # 10MB
     max_context_doc_size: int = 2 * 1024 * 1024  # 2MB — business-context text/markdown doc
+
+    # --- Public URL (optional) ---
+    # Empty by default — local dev, CI, and tests all leave this unset, so
+    # chart_url (see analyst_service.py) stays a relative path exactly as
+    # before. Set to the deployed Cloud Run URL (e.g. via `gcloud run
+    # deploy --update-env-vars PUBLIC_BASE_URL=https://...`) to make
+    # chart_url an absolute, directly-fetchable link instead — lets a
+    # caller use it as-is (an <img src>, a shared link) without having to
+    # know or prepend the server's own base URL itself.
+    public_base_url: str = ""
 
     # --- Paths ---
     data_dir: str = "data"
     uploads_dir: str = "data/uploads"
     charts_dir: str = "data/charts"
+    db_dir: str = "data"
 
     # --- RAG ---
+    # Phase 5: swapped from sentence-transformers (torch + transformers,
+    # ~2.5GB installed) to onnxruntime + tokenizers + a quantized ONNX
+    # export of the same model, bundled into the image at build time —
+    # never downloaded at runtime. Quality-parity verified against the
+    # original model in scripts/validate_onnx_embedder.py and
+    # scripts/validate_retrieval_threshold.py: quantization shifts raw
+    # similarity values slightly but changes zero retrieve/don't-retrieve
+    # decisions at this app's actual rag_distance_threshold.
     embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model_path: str = "models/all-MiniLM-L6-v2-onnx"
     rag_top_k: int = 3
     rag_distance_threshold: float = 1.5
 

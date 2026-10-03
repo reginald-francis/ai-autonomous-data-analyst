@@ -4,7 +4,7 @@ from contextlib import closing
 from tabulate import tabulate
 from src.services.llm_service import get_llm_client, get_model_for_complexity, get_retry_budget, DEFAULT_MODEL
 from src.services.database_service import load_csv_to_sqlite
-from src.services.rag_service import retrieve_session_context
+from src.services.rag_service import retrieve_session_context, format_context_block
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +41,7 @@ class SQLAgent:
 
         The underlying dataset looks like this:
         {data_context}
-
-        Additional business context:
-        {rag_context}
+        {format_context_block(rag_context)}
 
         The user is asking: {question}
         {HIGH_COMPLEXITY_SQL_SCAFFOLDING if complexity == "high" else ""}
@@ -76,9 +74,7 @@ class SQLAgent:
 
         The underlying dataset looks like this:
         {data_context}
-
-        Additional business context:
-        {rag_context}
+        {format_context_block(rag_context)}
 
         The user is asking: {question}
 

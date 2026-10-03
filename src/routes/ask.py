@@ -14,19 +14,46 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-
 
 class AskRequest(BaseModel):
     question: str
     file_path: str
 
 
+def _resolve_within_project_root(file_path: str) -> str:
+    """
+    Resolves file_path against the current working directory and rejects it
+    if the resolved path escapes that directory — e.g. "../../../etc/passwd"
+    or an absolute path elsewhere on disk. Raises HTTPException(403) on
+    escape. Returns the resolved absolute path on success.
+
+    The project root (cwd) is the boundary, not data/uploads/, because /ask
+    is documented as a local dev/testing endpoint that reads arbitrary
+    project-relative paths (sample_data.csv, tests/data/*.csv), not just
+    uploaded files.
+    """
+    root = os.path.realpath(os.getcwd())
+    resolved = os.path.realpath(os.path.join(root, file_path))
+    if os.path.commonpath([root, resolved]) != root:
+        raise HTTPException(
+            status_code=403,
+            detail="file_path must resolve to a location inside the project directory."
+        )
+    return resolved
+
+
 @router.post("/ask", response_model=AnalysisResponse)
 def ask_question(request: AskRequest):
+    if not get_settings().enable_ask_endpoint:
+        raise HTTPException(
+            status_code=404,
+            detail="This endpoint is disabled. Use POST /upload instead."
+        )
+
     logger.info("Request received: POST /ask")
     logger.info(f"Question: {request.question} | File: {request.file_path}")
-    result = analyse(request.question, request.file_path)
+    resolved_path = _resolve_within_project_root(request.file_path)
+    result = analyse(request.question, resolved_path)
     logger.info(f"Request completed | Status: {result.status} | Attempts: {result.attempts} | Time: {result.time_taken}")
     return result
 
@@ -106,12 +133,16 @@ async def upload_and_ask(
         if len(content) == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="File size exceeds the 10MB limit.")
+        max_file_size = get_settings().max_file_size
+        if len(content) > max_file_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size exceeds the {max_file_size // (1024 * 1024)}MB limit."
+            )
 
         # Generate a unique ID upfront so the filename and session_id match from the start
         session_id = str(uuid4())
-        file_path = f"data/uploads/{session_id}.csv"
+        file_path = f"{get_settings().uploads_dir}/{session_id}.csv"
 
         with open(file_path, "wb") as f:
             f.write(content)

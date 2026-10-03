@@ -4,6 +4,8 @@ import os
 import logging
 from contextlib import closing
 
+from src.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 def load_csv_to_sqlite(file_path: str, session_id: str = None, original_filename: str = None) -> dict:
@@ -15,10 +17,11 @@ def load_csv_to_sqlite(file_path: str, session_id: str = None, original_filename
         table_name = table_name.replace("-", "_").replace(" ", "_")
 
         # Prefix with session_id to prevent collision when multiple users upload same filename
+        db_dir = get_settings().db_dir
         if session_id:
-            db_path = f"data/{session_id}_{table_name}.db"
+            db_path = f"{db_dir}/{session_id}_{table_name}.db"
         else:
-            db_path = f"data/{table_name}.db"
+            db_path = f"{db_dir}/{table_name}.db"
         
         # Load CSV into dataframe
         df = pd.read_csv(file_path)

@@ -4,8 +4,8 @@
 scoped to roughly one weekend at ~10 hrs/week, has its own branch, and ends mergeable. Work
 **one phase per chat session** — read this file first to find the current phase.
 
-**Last updated:** 2026-09-11 · **Current phase:** 4b complete, 5 up next · **Branch:**
-`claude/v6.4-rag-context`
+**Last updated:** 2026-10-01 · **Current phase:** 6 — Ingestion, not yet started ·
+**Branch:** `claude/v8-ingestion` (not yet cut)
 
 ---
 
@@ -56,7 +56,7 @@ testing?"
 | 3 | API + integration tests, CI | `claude/v6.2-ci` | 1 | Sep 2026 | ✅ Done |
 | 4 | Dynamic data context | `claude/v6.3-data-context` | 1 | Sep 2026 | ✅ Done |
 | 4b | User-supplied RAG context | `claude/v6.4-rag-context` | 1 | Sep 2026 | ✅ Done |
-| 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | ⬜ |
+| 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | ✅ |
 | 6 | Ingestion: source TBD → Parquet | `claude/v8-ingestion` | 1 | Oct 2026 | ⬜ |
 | 7 | dbt + BigQuery: staging → marts | `claude/v9-dbt-bigquery` | 2 | Oct 2026 | ⬜ |
 | 8 | Data-source abstraction; agent reads marts | `claude/v10-warehouse-serving` | 2 | Nov 2026 | ⬜ |
@@ -503,27 +503,44 @@ session that doesn't upload one behaves exactly as before (no regression, no req
 
 ---
 
-## Phase 5 — Docker + Cloud Run + security ⬜
+## Phase 5 — Docker + Cloud Run + security ✅
 
 **Branch:** `claude/v7-deploy` · **2 weekends** — do not attempt in one
 
-### Security — before deploy, not after
+**Zero-cost mandate (added mid-phase, 2026-09-16):** this project must cost literal $0 through
+the portfolio phase, not "basically free." Verified live: Artifact Registry's 0.5 GB free tier
+is shared across the whole billing account (not per-project); Cloud Run's 2M requests/180k
+vCPU-s/360k GiB-s per month is permanent and effectively unlimited for a demo; Secret Manager's
+6 active versions + 10k accesses/month is trivial at low traffic. **The real image-size target
+is <0.5 GB, not the <1.5 GB done-criterion below** — that number only guarantees "small," not
+"free." Revise the done-criterion once Weekend 2 lands.
 
-1. **`/ask` path traversal** (`src/routes/ask.py`) — caller-supplied `file_path` read with no
-   validation. Harmless locally; a live arbitrary-file-read on a public URL. Resolve and
-   allowlist the path, or gate the endpoint behind a setting defaulting to `False`.
-2. **`exec()` of LLM-generated code** — `python_agent` and `chart_agent` both `exec` model
-   output with a dict named `safe_environment` that is **not a sandbox**: `exec` auto-injects
-   `__builtins__`, so `open`, `__import__`, and `os` are reachable. **This is RCE on a public
-   URL.** Mitigations: restricted `__builtins__`, AST allowlist validation, wall-clock timeout,
-   read-only Cloud Run filesystem, no service-account privileges, `max-instances=2`.
-   **Document this honestly in `docs/THREAT_MODEL.md`** — an interviewer who spots `exec` will
-   respect a documented threat model far more than a silent hope.
+### Security — before deploy, not after ✅ done (Weekend 1)
 
-### The Docker size problem
+1. ✅ **`/ask` path traversal** — `file_path` resolved against the project root, any escape
+   rejected (403); endpoint disabled by default via `Settings.enable_ask_endpoint`.
+2. ✅ **`exec()` of LLM-generated code** — `python_agent.execute_code()` (the only remaining
+   call site; `chart_agent` stopped executing LLM code in the Phase 4 redesign) now runs with a
+   restricted `__builtins__`, an AST pre-check rejecting imports and dunder-attribute access,
+   and a best-effort wall-clock timeout. Documented honestly in `docs/THREAT_MODEL.md`,
+   including the known gap that a thread-based timeout can't forcibly reclaim CPU/memory from a
+   hung snippet the way a subprocess kill could.
+3. **Found via live edge-case testing against the real Groq API, fixed alongside the above**
+   (see `docs/BUGS_FOUND.md`'s Phase 5 section for full detail): the sandbox initially broke
+   legitimate code (missing `pd`, missing `__build_class__`/`__name__`); `python_agent` had no
+   instruction against writing imports or generating charts itself, causing repeated
+   import-retry failures on chart questions; the planner never received a session's RAG
+   context, so a question phrased in glossary terms the user uploaded could get rejected as
+   out-of-scope before `python_agent` (which would've understood it) ever ran; raw
+   numpy/dict reprs were leaking into user-facing output. All fixed and verified live.
 
-`torch` + `sentence-transformers` + `faiss-cpu` is ~2.5 GB installed; a naive image is ~3.5 GB.
-Artifact Registry's free tier is **0.5 GB**.
+Remaining, deferred to Phase 13 (not blocking this phase — see `docs/BUGS_FOUND.md` #15-17):
+two more `chart_agent` bugs sharing the already-tracked root cause from findings #10-12.
+
+### The Docker size problem ✅ resolved — embedding swap, then the actual Dockerfile/deploy in Weekend 2 below
+
+`torch` + `sentence-transformers` + `faiss-cpu` was ~2.5 GB installed; a naive image was
+~3.5 GB. Artifact Registry's free tier is **0.5 GB** (see the zero-cost mandate above).
 
 **Resolved in Phase 4/4b — RAG stays, the embedding stack shrinks.** The original framing here
 assumed RAG would settle into retrieving one static 3 KB file (`routing_rules.txt`), in which
@@ -531,12 +548,66 @@ case deleting RAG entirely and inlining that file was the obvious move. Phase 4 
 case was decorative (the file duplicated rules already hardcoded in agent prompts) and removed
 it — but Phase 4b replaces it with a real RAG use case (user-supplied, per-session business
 context documents) that's genuinely too large and too variable to inline. So the Docker-size
-fix here is **ONNX embeddings (~90 MB) instead of `sentence-transformers`+`torch`** — keeps
-real retrieval capability, drops ~2.4 GB. "Precompute the index at build time" is no longer
-viable either way, since Phase 4b's documents don't exist until a user uploads them at
-runtime.
+fix here is ONNX embeddings instead of `sentence-transformers`+`torch` — keeps real retrieval
+capability, drops the ~2.5 GB stack entirely.
 
-**Done when:** public HTTPS URL answers a question; image <1.5 GB; `/ask` rejects traversal.
+**Implemented:** a quantized ONNX export of `all-MiniLM-L6-v2` (`models/all-MiniLM-L6-v2-onnx/`,
+~22.6 MB — well under the ~90 MB originally estimated, since the int8-quantized variant was
+used instead of fp32), run via `onnxruntime`+`tokenizers`, bundled into the repo/image at build
+time rather than downloaded at runtime (works with a read-only container filesystem, no
+HuggingFace network dependency in production). `rag_service.py`'s new `OnnxEmbedder` class
+hand-implements the mean-pooling + L2-normalization `sentence-transformers` did internally.
+Quality-parity verified two ways before `sentence-transformers`/`torch`/`transformers`/
+`scikit-learn`/`scipy` (and their now-orphaned transitive deps) were uninstalled:
+`scripts/validate_onnx_embedder.py` compares cosine similarity rankings against captured
+reference embeddings from the original model, and `scripts/validate_retrieval_threshold.py`
+confirms zero retrieve/don't-retrieve decision changes at this app's actual
+`rag_distance_threshold` — the two raw ranking differences quantization introduced were both
+between near-zero, statistically-insignificant similarity pairs well below the real cutoff; the
+one genuinely-related pair tested stayed at an identical 0.760 in both models. Verified live
+against the real Groq API afterward (the "senior employee" glossary scenario from finding #13).
+`requirements.txt` dropped from 79 to 65 packages.
+
+### Weekend 2 ✅ done (2026-10-01)
+
+Settings fixes (`SESSION_TTL_MINUTES`/`MAX_FILE_SIZE` were hardcoded, silently ignoring their
+`Settings` fields); the chart-image-serving gap resolved — `/charts/{uuid}.png` static route in
+`main.py`, a new `chart_url` field (`chart_path` kept for backward compat), chart filenames are
+random UUIDs rather than `session_id`-derived (closes a real access-credential leak — see
+`docs/THREAT_MODEL.md`'s "Chart URL exposure"), and charts are now deleted on session cleanup
+(previously never deleted — a slow memory leak on Cloud Run's in-memory filesystem);
+`requirements.txt` split into runtime-only + `requirements-dev.txt`, four genuinely-unused
+packages dropped (`openai`, `typer`, `rich`, `shellingham`) and one missing one added
+(`huggingface-hub`, a real `tokenizers` dependency a drifted local venv had silently gone
+without — only surfaced by testing a *genuinely fresh* install, not `pip show` on an
+already-populated venv); `Dockerfile` + `.dockerignore` + a CI `docker` job that builds, sizes,
+and smoke-tests `/health` on every push.
+
+**GCP setup and deploy, done 2026-10-01.** Project `autonomous-data-agent`, region
+`us-central1`, standard pay-as-you-go billing (no 90-day trial-expiry risk), $100 INR (~$1)
+budget alert. Artifact Registry repo `images`, Secret Manager secret `groq-api-key`, dedicated
+runtime service account `agent-runtime` scoped to `secretmanager.secretAccessor` on that one
+secret only. Deployed to Cloud Run (`--max-instances=1 --concurrency=1 --min-instances=0
+--memory=1Gi --allow-unauthenticated`).
+
+**Live URL: `https://agent-1079929934435.us-central1.run.app`.** All done-when checks passed:
+`/health` responds, `/upload` answers a real question, a chart question returns a working
+`chart_url`, `/ask` 404s. A `PUBLIC_BASE_URL` env var was added post-deploy so `chart_url`
+returns a full clickable link instead of a bare path. An Artifact Registry cleanup policy
+(keep the 2 most recent image versions) was applied, schema verified against Google's own docs
+rather than written from memory.
+
+**Image size result: 211 MB compressed, 599 MB uncompressed** — well under the 0.5 GB zero-cost
+target.
+
+**Accepted, not fixed:** an expired session's files (CSV, DB, chart PNGs) can sit for up to
+`TTL + 5 minutes` before deletion — `session_cleanup_loop()`'s periodic sweep is a separate
+path from the lazy delete-on-access, and nothing in this phase changed its 5-minute interval.
+Noted as a known, low-priority limitation, not a bug — revisit only if Cloud Run memory
+pressure becomes a real problem.
+
+**Done when:** public HTTPS URL answers a question; image <0.5 GB (revised from <1.5 GB per the
+zero-cost mandate); `/ask` rejects traversal (already true).
 
 ---
 
@@ -717,18 +788,28 @@ Architecture diagram, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` (an ADR log �
 genuinely impressive), README rewrite with both framings, CI + coverage badges. Move
 `src/groq_all_models.py` to `scripts/` or delete it.
 
-**Candidate pickup — chart data fidelity (deferred from Phase 4):** `docs/BUGS_FOUND.md`
-findings #10-#12 — chart aggregation can silently render sums where an average was correctly
-computed, SQL-filtered chart questions can silently mix in rows the filter excluded, and
-scatter charts over-aggregate instead of showing per-row spread. All three share one root
-cause (`chart_agent` re-derives data from the raw file instead of consuming what python/sql
-already computed) and one proposed fix, already scoped in that doc: reuse the SQL agent's
-query string for SQL-routed charts (cheap, safe, fixes #11 fully), and for python-routed
-charts, stop the duplicate-detection fallback from overriding an explicit aggregation choice
-and skip grouping for scatter (fixes #10/#12, though not with the same full-fidelity guarantee
-SQL-reuse gives). Deliberately deferred past Phase 4 since it's a secondary/decorative feature
-and Phase 4's actual done-criterion (dataset-agnostic routing) doesn't depend on it — revisit
-here, or sooner if convenient.
+**Candidate pickup — chart data fidelity (deferred from Phase 4, escalated in Phase 5):**
+`docs/BUGS_FOUND.md` findings #10-#12, #15, #16, and **#18** — chart aggregation can silently
+render sums where an average was correctly computed, SQL-filtered chart questions can silently
+mix in rows the filter excluded, scatter and line/trend charts over-aggregate or show
+non-chronological garbage, and (found live during Phase 5, #18) `python_agent` and
+`chart_agent` can flatly contradict each other in the same response — a RAG business-context
+instruction honored in the text answer is silently ignored in the chart, because chart_agent's
+plotted values never pass through an LLM at all, by design. All share one root cause
+(`chart_agent` re-derives data from the raw file instead of consuming what python/sql already
+computed). The originally-proposed cheap fix (reuse the SQL agent's query string for SQL-routed
+charts; stop the duplicate-detection fallback from overriding an explicit aggregation choice;
+skip grouping for scatter) still fixes #10-#12/#15/#16, but **does not fix #18** — no partial
+fix reaches #18, since the issue isn't a wrong aggregation choice but chart_agent's numbers
+being structurally unreachable by any LLM-facing instruction (RAG-derived or otherwise).
+**#18 should be this pickup's acceptance criterion**, not just the earlier aggregation-fidelity
+cases: the fix isn't done until python_agent and chart_agent are structurally incapable of
+disagreeing about the same computed value in the same response — which likely means the
+bigger-footprint fix `docs/BUGS_FOUND.md` #10-12 already named as considered-but-deferred
+(threading python_agent's actual computed value into chart_agent, not just its printed text) is
+no longer optional to skip. Deliberately deferred past Phase 4 and kept out of Phase 5's
+Docker+security scope since it's a secondary/decorative feature and neither phase's actual
+done-criterion depends on it — revisit at Phase 13, or sooner if convenient.
 
 ---
 
@@ -818,6 +899,8 @@ during Phases 1–13.
 | 20 | `TEST_RESULTS.md` documents 31 unreproducible results | Low | 3 |
 | 21 | `clean_code` is duplicated verbatim in `python_agent.py` and `chart_agent.py`, plus a near-identical `clean_sql` in `sql_agent.py` — found while writing `test_cleaners.py` (2026-08-26). Candidate for a shared helper, not urgent | Low | 2 |
 | 22 | `openai/gpt-oss-20b`/`120b` (the only free-tier Groq text models — see Phase 1) are not at parity with current frontier models. Fine for this portfolio's purposes (routing/codegen quality is adequate, and the point is demonstrating architecture, not chasing SOTA benchmarks), but worth revisiting once the project is no longer constrained to a single free-tier provider — e.g. if Phase 5+'s deploy step ever adds a paid-tier or alternate-provider option. Raised 2026-09-11 during Phase 4b manual verification — not a defect, a noted future upgrade candidate. | Low | Candidate — revisit post-13 |
+| 23 | RAG's embedding model, `all-MiniLM-L6-v2` (see Phase 5's ONNX swap), is a mid-tier, 2021-era model on MTEB retrieval benchmarks — newer small models (`bge-small-en-v1.5`, `e5-small-v2`, etc.) generally score higher at similar or smaller size. Kept for Phase 5 because (a) this app's actual retrieval task — matching a question against short, plainly-worded, user-authored glossary sentences — is close to the easiest realistic case for any embedding model (validated: the one genuinely-related sentence pair scored 0.76 similarity vs. ~0.0-0.18 for unrelated pairs, an unambiguous gap), (b) it has well-established, battle-tested pre-converted ONNX exports, lowering conversion risk for a phase already doing something new, and (c) model choice is orthogonal to Phase 5's actual done-criteria (deployability/security), so churning it now would mean redoing the quality-parity validation for a change unlikely to be observable in this app's real inputs. Raised 2026-09-17 during the ONNX swap — not a defect, a candidate low-cost upgrade (reuse `scripts/validate_onnx_embedder.py`/`validate_retrieval_threshold.py` against a new candidate model) once the deploy itself is stable. | Low | Candidate — revisit post-5 or ad hoc |
+| 24 | `rag_service.py`'s `split_into_chunks()` splits only on blank-line paragraph breaks and drops anything under 5 words — a single unformatted paragraph becomes one giant chunk, and short-but-real definitions (e.g. "Won = closed-won deal.") can be silently dropped. Raised 2026-10-03 as an idea to have an LLM do the chunking instead; recommendation after discussion: a deterministic improvement (sentence-aware splitting, a small overlap between adjacent chunks, a lower/smarter word floor) fits this project's established "LLM for judgment calls, deterministic code for mechanical work" pattern (see Phase 4's chart-agent redesign) better than an LLM chunking call would. Not a defect — this hasn't caused an observed bad result yet — a candidate improvement. | Low | Candidate — revisit ad hoc |
 
 ## Cost summary — free tiers only
 

@@ -1,13 +1,86 @@
+import ast
+import builtins
 import logging
+import threading
 import pandas as pd
 from contextlib import redirect_stdout
 from io import StringIO
 from src.services.llm_service import get_llm_client, get_model_for_complexity, get_retry_budget, DEFAULT_MODEL
-from src.services.rag_service import retrieve_session_context
+from src.services.rag_service import retrieve_session_context, format_context_block
 from fastapi import HTTPException
 import time
 
 logger = logging.getLogger(__name__)
+
+# exec() sandboxing (PHASES.md risk #2, docs/THREAT_MODEL.md). exec()
+# auto-injects the real __builtins__ into any globals dict that doesn't
+# already define that key — the old `safe_environment = {"df": df}` looked
+# restrictive by name but left open()/__import__()/eval() fully reachable.
+# This allowlist is deliberately generous with safe names (so ordinary
+# pandas-shaped code doesn't burn retries on a missing builtin) and strict
+# only about the genuinely dangerous ones: no open, __import__, eval, exec,
+# compile, input, getattr/setattr/delattr, globals/locals/vars.
+_ALLOWED_BUILTINS = {
+    name: getattr(builtins, name)
+    for name in (
+        "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter",
+        "float", "format", "frozenset", "int", "isinstance", "issubclass",
+        "iter", "len", "list", "map", "max", "min", "next", "pow", "print",
+        "range", "repr", "reversed", "round", "set", "slice", "sorted",
+        "str", "sum", "tuple", "type", "zip",
+        "True", "False", "None",
+        "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+        "ZeroDivisionError", "StopIteration", "AttributeError",
+        "NotImplementedError", "ArithmeticError", "OverflowError",
+        # Not something generated code calls directly — the interpreter
+        # itself invokes this internally to execute any `class` statement.
+        # Without it, legitimate code defining a helper class (a real,
+        # if uncommon, shape for the high-complexity scaffolding prompt to
+        # produce) fails with "__build_class__ not found" even though the
+        # class itself is completely benign. Found via manual edge-case
+        # testing (2026-09-15), not something the unit tests caught.
+        "__build_class__",
+    )
+    if hasattr(builtins, name)
+}
+
+EXEC_TIMEOUT_SECONDS = 10
+
+
+def _validate_code_is_safe(code: str) -> None:
+    """Static AST check, run before exec(). Restricted builtins alone don't
+    stop two things: bare `import` statements (a distinct syntax node, not
+    a name lookup a builtins dict can intercept) and dunder-attribute
+    sandbox escapes like ().__class__.__bases__[0].__subclasses__(), which
+    walk Python's object graph using only ordinary attribute access. Raises
+    a plain Exception on any violation — this flows into the existing
+    retry loop the same as any other code failure, so a rejected snippet
+    just prompts the LLM to try again without the forbidden construct."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        raise Exception(f"Generated code has a syntax error: {e}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            # Actionable, not just descriptive — this message flows straight
+            # into fix_code()'s retry prompt as the error context. A bare
+            # "may not use import statements" left the retry loop to guess
+            # why (observed: it removed the import but kept using the
+            # now-undefined name, then re-added the import to fix that,
+            # cycling until attempts ran out — see PHASES.md/BUGS_FOUND.md
+            # for the concrete case: matplotlib import for a chart question).
+            raise Exception(
+                "Generated code may not use import statements. pandas is "
+                "already available as 'pd' and the dataframe as 'df' — do "
+                "not import pandas or anything else. Do not import or use "
+                "any plotting library (matplotlib, seaborn, plotly) either "
+                "— never generate a chart; only compute and print the "
+                "requested data."
+            )
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
+            raise Exception(f"Generated code may not access dunder attributes ({node.attr!r}).")
+
 
 # Added for "high" complexity only (see run()). Complexity used to also
 # scale how many sample rows appeared in the prompt (PROMPT_SAMPLE_ROWS),
@@ -39,10 +112,32 @@ class PythonAgent:
 
     def execute_code(self, code: str, file_path: str) -> str:
         try:
+            _validate_code_is_safe(code)
+
             df = pd.read_csv(file_path)
 
-            # Create a safe environment with only df available
-            safe_environment = {"df": df}
+            # __builtins__ explicitly restricted — see _ALLOWED_BUILTINS.
+            # Without this key, exec() silently injects the real,
+            # unrestricted __builtins__ into this dict regardless of its
+            # name, which is what made the old "safe_environment" not
+            # actually safe.
+            #
+            # pd is provided explicitly: generate_code()'s own prompt tells
+            # the LLM to call pd.to_datetime()/pd.Grouper() for date-based
+            # grouping, but pd was never actually in this environment (found
+            # via manual edge-case testing, 2026-09-15) — every date/trend
+            # question's generated code has been failing with "name 'pd' is
+            # not defined" since this dict only ever contained "df". Import
+            # access is otherwise blocked (see _validate_code_is_safe), so
+            # this one pre-approved module reference doesn't reopen that.
+            # __name__ is needed alongside __build_class__ above — a class
+            # statement's machinery reads the enclosing __name__ (normally
+            # supplied by the real module namespace) even for a completely
+            # ordinary class body. Also found via manual edge-case testing.
+            safe_environment = {
+                "df": df, "pd": pd, "__name__": "sandboxed_code",
+                "__builtins__": _ALLOWED_BUILTINS,
+            }
 
             # Capture printed output. redirect_stdout guarantees sys.stdout
             # is restored on the way out of the `with` block even if exec()
@@ -52,8 +147,33 @@ class PythonAgent:
             # reassignment is a shared global that a second in-flight
             # request could also be reassigning at the same time.
             captured_output = StringIO()
-            with redirect_stdout(captured_output):
-                exec(code, safe_environment)
+            exec_error = []
+
+            def _run():
+                try:
+                    with redirect_stdout(captured_output):
+                        exec(code, safe_environment)
+                except Exception as inner_e:
+                    exec_error.append(inner_e)
+
+            # Best-effort wall-clock bound, not a hard resource guarantee:
+            # CPython threads can't be forcibly killed, so a snippet stuck
+            # in a tight C-level pandas/numpy loop keeps running in the
+            # background after this times out, still consuming CPU. This
+            # bounds how long the *caller* waits; it does not reclaim that
+            # thread's CPU/memory. A real hard-kill needs a subprocess
+            # boundary (OS can terminate a process, not a thread) — noted
+            # as a near-term follow-up in docs/THREAT_MODEL.md rather than
+            # implemented here.
+            worker = threading.Thread(target=_run, daemon=True)
+            worker.start()
+            worker.join(EXEC_TIMEOUT_SECONDS)
+
+            if worker.is_alive():
+                raise Exception(f"Execution exceeded the {EXEC_TIMEOUT_SECONDS}s time limit.")
+
+            if exec_error:
+                raise exec_error[0]
 
             output = captured_output.getvalue()
 
@@ -71,22 +191,23 @@ class PythonAgent:
         You are a data analyst. You have access to a CSV file with the following structure:
 
         {data_context}
-
-        Additional business context:
-        {rag_context}
+        {format_context_block(rag_context)}
 
         The user is asking: {question}
         {HIGH_COMPLEXITY_SCAFFOLDING if complexity == "high" else ""}
-        Write Python code using pandas to answer this question.
-        Always write actual Python code, never answer the question directly.
-        Even if the answer seems simple, always write Python code to compute it.
-        Always print the final result using print().
-        Make sure the last line of your code is always a print statement.
-        The dataframe is already loaded as 'df'.
-        Return only the Python code, nothing else.
-        Be precise about statistical operations: use .mean() for average, .sum() for total, .median() for median, .std() for standard deviation.
-        When grouping by month always use pd.Grouper(key='date', freq='ME') — never use freq='M' as it is deprecated in pandas >= 2.2.
-        Always convert date columns with pd.to_datetime() before any date-based grouping.
+        Write Python code using pandas to answer this question — never answer directly, even
+        if the answer seems simple. The last line must be a print() of the final result.
+        'df' (the dataframe) and 'pd' (pandas) are already available — never write import
+        statements, not even 'import pandas as pd'.
+        Never generate a chart, plot, or import a plotting library (matplotlib, seaborn,
+        plotly) — a separate step handles visualization; just compute and print the data.
+        Print clean, human-readable output — never a raw dict or tuple containing numpy
+        types (e.g. np.float64(...)); convert values to plain Python numbers/strings first.
+        Return only the code, nothing else.
+        Be precise: .mean() for average, .sum() for total, .median() for median, .std() for
+        standard deviation.
+        For monthly grouping use pd.Grouper(key='date', freq='ME') (freq='M' is deprecated).
+        Convert date columns with pd.to_datetime() before any date-based grouping.
         """
 
         try:
@@ -116,9 +237,7 @@ class PythonAgent:
         You are a data analyst. You have access to a CSV file with the following structure:
 
         {data_context}
-
-        Additional business context:
-        {rag_context}
+        {format_context_block(rag_context)}
 
         The user is asking: {question}
 
@@ -128,12 +247,16 @@ class PythonAgent:
         But it failed with this error:
         {error}
         {HIGH_COMPLEXITY_SCAFFOLDING if complexity == "high" else ""}
-        Fix the code and return only the corrected Python code, nothing else.
-        The dataframe is already loaded as 'df'.
-        Always print the final result using print().
-        Make sure the last line of your code is always a print statement which prints the output.
+        Fix the code and return only the corrected code, nothing else. The last line must be
+        a print() of the final result.
+        'df' (the dataframe) and 'pd' (pandas) are already available — never write import
+        statements, not even 'import pandas as pd'.
+        Never generate a chart, plot, or import a plotting library (matplotlib, seaborn,
+        plotly) — a separate step handles visualization; just compute and print the data.
+        Print clean, human-readable output — never a raw dict or tuple containing numpy
+        types (e.g. np.float64(...)); convert values to plain Python numbers/strings first.
         """
-    
+
         try:
             logger.info("LLM error fix call started")
             llm_start = time.time()

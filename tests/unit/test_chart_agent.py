@@ -325,3 +325,38 @@ def test_chart_agent_run_raises_on_missing_column(tmp_path, sample_csv_path):
 
     with pytest.raises(Exception, match="Chart agent failed"):
         agent.run("Show revenue by region", "irrelevant printed result", str(csv_path))
+
+
+def test_chart_filename_never_contains_session_id(tmp_path, sample_csv_path):
+    """Chart files are served over HTTP (main.py's /charts mount) —
+    naming one after session_id would leak that session's access key to
+    anyone who saw the chart's URL. See docs/THREAT_MODEL.md."""
+    import shutil
+    csv_path = tmp_path / "sample.csv"
+    shutil.copy(sample_csv_path, csv_path)
+
+    session_id = "s3cr3t-session-id"
+    spec = {"chart_type": "bar", "x_column": "region", "y_column": "revenue", "aggregation": "sum", "title": "T"}
+    agent = ChartAgent(client=_FakeChartClient(spec), settings=type("S", (), {"charts_dir": str(tmp_path)})())
+
+    chart_path = agent.run(
+        "Show revenue by region", "irrelevant printed result", str(csv_path), session_id=session_id
+    )
+
+    assert session_id not in chart_path
+
+
+def test_two_chart_runs_in_the_same_session_get_different_filenames(tmp_path, sample_csv_path):
+    """Chart filenames used to be derived from session_id, so a follow-up
+    chart in the same session silently overwrote the previous one."""
+    import shutil
+    csv_path = tmp_path / "sample.csv"
+    shutil.copy(sample_csv_path, csv_path)
+
+    spec = {"chart_type": "bar", "x_column": "region", "y_column": "revenue", "aggregation": "sum", "title": "T"}
+    agent = ChartAgent(client=_FakeChartClient(spec), settings=type("S", (), {"charts_dir": str(tmp_path)})())
+
+    first = agent.run("Show revenue by region", "result", str(csv_path), session_id="same-session")
+    second = agent.run("Show revenue by region again", "result", str(csv_path), session_id="same-session")
+
+    assert first != second

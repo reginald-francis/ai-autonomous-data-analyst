@@ -6,6 +6,52 @@ from src.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+class OnnxEmbedder:
+    """Drop-in replacement for SentenceTransformer's .encode(texts) ->
+    np.ndarray interface, backed by onnxruntime + tokenizers instead of
+    torch + transformers (Phase 5 — see PHASES.md's Docker-size tradeoff).
+    Loads the model bundled under model_dir at build time — never
+    downloaded at runtime, so this works with a read-only container
+    filesystem and has no HuggingFace network dependency in production.
+
+    Bypassing SentenceTransformer's wrapper means its mean-pooling +
+    L2-normalization postprocessing has to be replicated by hand here;
+    quality-parity against the original model was verified in
+    scripts/validate_onnx_embedder.py and
+    scripts/validate_retrieval_threshold.py before this replaced it.
+    """
+
+    def __init__(self, model_dir: str):
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        self._tokenizer = Tokenizer.from_file(f"{model_dir}/tokenizer.json")
+        self._tokenizer.enable_padding()
+        self._session = ort.InferenceSession(f"{model_dir}/model_quantized.onnx")
+
+    def encode(self, texts: list) -> np.ndarray:
+        encodings = self._tokenizer.encode_batch(texts)
+        input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
+        token_type_ids = np.array([e.type_ids for e in encodings], dtype=np.int64)
+
+        outputs = self._session.run(
+            None,
+            {"input_ids": input_ids, "attention_mask": attention_mask, "token_type_ids": token_type_ids},
+        )
+        last_hidden_state = outputs[0]
+        return self._mean_pool_and_normalize(last_hidden_state, attention_mask)
+
+    @staticmethod
+    def _mean_pool_and_normalize(last_hidden_state: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+        mask = attention_mask[..., None].astype(np.float32)
+        summed = (last_hidden_state * mask).sum(axis=1)
+        counts = np.clip(mask.sum(axis=1), a_min=1e-9, a_max=None)
+        mean_pooled = summed / counts
+        norms = np.linalg.norm(mean_pooled, axis=1, keepdims=True)
+        return mean_pooled / np.clip(norms, a_min=1e-9, a_max=None)
+
+
 def split_into_chunks(documents: list) -> list:
     all_chunks = []
     for doc in documents:
@@ -20,10 +66,10 @@ def split_into_chunks(documents: list) -> list:
 
 class RagIndex:
     """Owns the embedding model, FAISS index, and chunk store as instance
-    state instead of module globals. The SentenceTransformer is constructed
+    state instead of module globals. The OnnxEmbedder is constructed
     lazily in _get_model() on first actual use (build or retrieve), not at
     import time — importing this module (or anything that imports it, e.g.
-    every agent) no longer pays the ~35s model-load cost just to run."""
+    every agent) doesn't pay the model-load cost just to run."""
 
     def __init__(self, settings=None):
         self._settings = settings if settings is not None else get_settings()
@@ -33,9 +79,11 @@ class RagIndex:
 
     def _get_model(self):
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            logger.info(f"Loading embedding model: {self._settings.embedding_model}")
-            self._model = SentenceTransformer(self._settings.embedding_model)
+            logger.info(
+                f"Loading embedding model: {self._settings.embedding_model} "
+                f"(ONNX, from {self._settings.embedding_model_path})"
+            )
+            self._model = OnnxEmbedder(self._settings.embedding_model_path)
         return self._model
 
     def build_from_chunks(self, chunks: list) -> None:
@@ -121,3 +169,17 @@ def drop_session(session_id: str) -> None:
     the same TTL/cleanup cadence as the session's uploaded CSV and DB files."""
     if _session_indexes.pop(session_id, None) is not None:
         logger.info(f"Deleted session RAG index: {session_id}")
+
+
+def format_context_block(rag_context: str) -> str:
+    """Formats retrieve_session_context()'s result for splicing into a
+    prompt — the labeled "Additional business context" section every
+    agent's prompt (planner/python/sql) includes. Returns "" when there's
+    nothing to add (no session document, or nothing relevant to this
+    question), instead of every prompt paying for an empty labeled section
+    every single call — real token savings against Groq's tight 8K TPM
+    ceiling (see CLAUDE.md), and one less ambiguous "is this section
+    empty on purpose?" signal for the model to parse."""
+    if not rag_context:
+        return ""
+    return f"\n\nAdditional business context:\n{rag_context}"

@@ -1,6 +1,7 @@
 import logging
 import json
 from src.services.llm_service import get_llm_client, DEFAULT_MODEL, MODEL_ROUTING
+from src.services.rag_service import retrieve_session_context, format_context_block
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class PlannerAgent:
         logger.info(f"Complexity classified as: {complexity}")
         return complexity
 
-    def run(self, question: str, row_count: int = 0, data_context: str = "") -> dict:
+    def run(self, question: str, row_count: int = 0, data_context: str = "", session_id: str = None) -> dict:
         logger.info(f"Planner agent analyzing question: {question}")
 
         # data_context is generated fresh per uploaded file by
@@ -61,6 +62,16 @@ class PlannerAgent:
         # happened on any CSV that wasn't TechMart's own sample data: the
         # planner was reading facts about a dataset that wasn't the one
         # actually uploaded.
+        #
+        # rag_context (Phase 5 follow-up to 4b): python_agent/sql_agent
+        # already retrieved a session's uploaded business-context document
+        # for their own prompts, but the planner never did — so a question
+        # phrased in glossary terms the document defines (e.g. "senior
+        # employee" meaning age > 40) could get rejected as out_of_scope
+        # here before python/sql ever got a chance to see that definition.
+        # Found via live manual testing, 2026-09-16.
+        business_context = format_context_block(retrieve_session_context(session_id, question))
+
         routing_prompt = f"""
         You are a planner for a data analysis system.
         You have these specialized agents available:
@@ -76,9 +87,11 @@ class PlannerAgent:
         - If the question needs both computation and visualization — use ["python", "chart"]
         - If the question is about general world knowledge, external facts, or topics completely unrelated to the data (e.g. weather, geography, people, news) — use "none"
         - Only use "none" when the question is unrelated to data analysis in general — never because a specific value (e.g. a category, name, or id) isn't one you recognize. The actual dataset below is authoritative; trust it over any assumption.
+        - A term you don't recognize may be defined in the business context below (e.g. "senior employee" meaning age > 40) — check there before deciding a question is out of scope.
 
         The actual uploaded dataset looks like this:
         {data_context}
+        {business_context}
 
         Based on the user question, decide which agents to use and in what order.
 

@@ -4,6 +4,7 @@ import logging
 import threading
 from datetime import datetime, timedelta
 
+from src.config import get_settings
 from src.services import rag_service
 
 logger = logging.getLogger(__name__)
@@ -11,8 +12,6 @@ logger = logging.getLogger(__name__)
 # In-memory session store: session_id -> session data
 _sessions: dict = {}
 _lock = threading.Lock()  # prevents race conditions when multiple requests hit at once
-
-SESSION_TTL_MINUTES = 30
 
 
 def _safe_remove(path: str) -> bool:
@@ -31,7 +30,8 @@ def cleanup_orphaned_files() -> None:
     """Delete all files in uploads, charts, and generated DB files on startup.
     These are orphans — server restarted and session memory was wiped, so
     there is no session that will ever clean them up."""
-    dirs = ["data/uploads", "data/charts"]
+    settings = get_settings()
+    dirs = [settings.uploads_dir, settings.charts_dir]
     total = 0
     for directory in dirs:
         for f in glob.glob(f"{directory}/*"):
@@ -43,7 +43,7 @@ def cleanup_orphaned_files() -> None:
     # Session-scoped SQLite databases (data/{session_id}_{table_name}.db) are
     # generated the same way — with no session left in memory, nothing else
     # will ever clean them up.
-    for db_file in glob.glob("data/*.db"):
+    for db_file in glob.glob(f"{settings.db_dir}/*.db"):
         if _safe_remove(db_file):
             total += 1
 
@@ -59,8 +59,22 @@ def create_session(session_id: str, file_path: str, original_filename: str) -> N
             "original_filename": original_filename,
             "created_at": datetime.now(),
             "last_accessed": datetime.now(),
+            "chart_paths": [],
         }
     logger.info(f"Session created: {session_id} | file: {original_filename}")
+
+
+def register_chart(session_id: str, chart_path: str) -> None:
+    """Record a chart file this session generated, so its cleanup path
+    below can delete it later — chart files are never deleted otherwise
+    (see docs/BUGS_FOUND.md), which is a slow memory leak now that Cloud
+    Run's filesystem lives in RAM. No-op if the session isn't tracked (e.g.
+    /ask's auto-generated session_id, which was never registered via
+    create_session either)."""
+    with _lock:
+        session = _sessions.get(session_id)
+        if session is not None:
+            session.setdefault("chart_paths", []).append(chart_path)
 
 
 def get_session(session_id: str) -> dict | None:
@@ -71,7 +85,7 @@ def get_session(session_id: str) -> dict | None:
             return None
         # Check if session has expired
         age = datetime.now() - session["last_accessed"]
-        if age > timedelta(minutes=SESSION_TTL_MINUTES):
+        if age > timedelta(minutes=get_settings().session_ttl_minutes):
             logger.info(f"Session expired on access: {session_id}")
             _delete_session_files(session_id, session)
             del _sessions[session_id]
@@ -83,11 +97,12 @@ def get_session(session_id: str) -> dict | None:
 def cleanup_expired_sessions() -> None:
     """Delete all sessions whose last_accessed time exceeds the TTL. Called by background task."""
     now = datetime.now()
+    ttl = timedelta(minutes=get_settings().session_ttl_minutes)
     expired = []
     with _lock:
         for session_id, session in _sessions.items():
             age = now - session["last_accessed"]
-            if age > timedelta(minutes=SESSION_TTL_MINUTES):
+            if age > ttl:
                 expired.append((session_id, session))
         for session_id, session in expired:
             _delete_session_files(session_id, session)
@@ -98,15 +113,23 @@ def cleanup_expired_sessions() -> None:
 
 
 def _delete_session_files(session_id: str, session: dict) -> None:
-    """Delete the uploaded CSV and any generated DB files for this session."""
+    """Delete the uploaded CSV, any generated chart PNGs, and any generated
+    DB files for this session."""
     # Delete uploaded CSV
     file_path = session.get("file_path", "")
     if file_path and os.path.exists(file_path):
         if _safe_remove(file_path):
             logger.info(f"Deleted session file: {file_path}")
 
+    # Delete this session's chart PNGs (see register_chart) — chart
+    # filenames are random UUIDs, not session_id-derived, so this list is
+    # the only way cleanup can find them again.
+    for chart_path in session.get("chart_paths", []):
+        if os.path.exists(chart_path) and _safe_remove(chart_path):
+            logger.info(f"Deleted session chart: {chart_path}")
+
     # Delete any generated DB files for this session (pattern: data/{session_id}_*.db)
-    for db_file in glob.glob(f"data/{session_id}_*.db"):
+    for db_file in glob.glob(f"{get_settings().db_dir}/{session_id}_*.db"):
         if _safe_remove(db_file):
             logger.info(f"Deleted session DB: {db_file}")
 

@@ -5,12 +5,14 @@ import pandas as pd
 from datetime import datetime
 from uuid import uuid4
 from fastapi import HTTPException
+from src.config import get_settings
 from src.services.llm_service import DEFAULT_MODEL
 from src.services.data_context_service import generate_data_context
 from src.agents.planner_agent import PlannerAgent
 from src.agents.python_agent import PythonAgent
 from src.agents.sql_agent import SQLAgent
 from src.agents.chart_agent import ChartAgent
+from src.services.session_service import register_chart
 from src.utils.schemas import AnalysisResponse
 
 
@@ -65,7 +67,7 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
     # ruled out of scope — see docs/BUGS_FOUND.md and PHASES.md Phase 4.
     data_context = generate_data_context(file_path)
 
-    plan = planner.run(question, row_count, data_context)
+    plan = planner.run(question, row_count, data_context, session_id=session_id)
     agents = plan.get("agents", ["python"])
     task_type = plan.get("task_type", "analysis")
     complexity = plan.get("complexity", "medium")
@@ -108,6 +110,7 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
 
     result = None
     chart_path = None
+    chart_url = None
     agents_used = []
     model_used = DEFAULT_MODEL
 
@@ -139,6 +142,15 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
             logger.info("Routing to Chart agent")
             chart_path = chart_agent.run(question, result, file_path, complexity, session_id=session_id, data_context=data_context)
             agents_used.append("chart")
+            # chart_path is a server-local filesystem path — chart_url is
+            # the fetchable equivalent, served by main.py's /charts mount.
+            # Absolute when Settings.public_base_url is set (the deployed
+            # Cloud Run URL), so a caller never has to know or prepend the
+            # server's own base URL; stays relative — today's behavior —
+            # when it isn't (local dev, CI, tests).
+            base_url = get_settings().public_base_url.rstrip("/")
+            chart_url = f"{base_url}/charts/{os.path.basename(chart_path)}"
+            register_chart(session_id, chart_path)
 
     except Exception as e:
         logger.error(f"Agent execution failed: {str(e)}")
@@ -159,6 +171,7 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
             reasoning=reasoning,
             complexity=complexity,
             chart_path=chart_path,
+            chart_url=chart_url,
             session_id=session_id
         )
 
@@ -181,5 +194,6 @@ def analyse(question: str, file_path: str, session_id: str = None, original_file
         reasoning=reasoning,
         complexity=complexity,
         chart_path=chart_path,
+        chart_url=chart_url,
         session_id=session_id
     )

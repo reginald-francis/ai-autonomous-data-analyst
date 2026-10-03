@@ -106,8 +106,12 @@ class ChartAgent:
         self.model = get_model_for_complexity(complexity)
         logger.info(f"Chart agent running for question: {question} | complexity={complexity} | model={self.model}")
 
-        chart_id = session_id if session_id else str(uuid4())
-        chart_path = f"{self.charts_dir}/{chart_id}.png"
+        # Always a fresh random name, never session_id — chart_path is served
+        # over HTTP (see main.py's /charts mount), and session_id doubles as
+        # the caller's access key to that session's data. Naming a chart
+        # file after it would leak that key to anyone who saw the chart's
+        # URL. See docs/THREAT_MODEL.md's "Chart URL exposure" section.
+        chart_path = f"{self.charts_dir}/{uuid4().hex}.png"
 
         try:
             spec = self._get_chart_spec(question, data, data_context)

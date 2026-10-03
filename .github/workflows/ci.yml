@@ -22,9 +22,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        # requirements-dev.txt pulls in requirements.txt plus pytest/ruff/
+        # coverage — the Docker image built in a later step installs only
+        # requirements.txt, so this is where test/lint tooling stays scoped
+        # to CI and local dev.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Lint with ruff
         run: ruff check .
@@ -35,3 +39,34 @@ jobs:
         # without a real key. live_api-marked tests are excluded by
         # pytest.ini's addopts, so this never attempts a real Groq call.
         run: pytest -m "not live_api" --cov=src --cov-report=term-missing --cov-fail-under=70
+
+  # Builds the deploy image on every push and reports its size against
+  # Artifact Registry's 0.5GB free-tier limit (Phase 5) — catches a build
+  # break or a size regression immediately, before it's ever a problem on
+  # the personal machine doing the real Cloud Run deploy. Nothing here is
+  # pushed anywhere and no GCP credentials are involved.
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t analyst:ci .
+
+      - name: Report image size
+        run: |
+          echo "Uncompressed:"
+          docker image inspect analyst:ci --format='{{.Size}}' | numfmt --to=iec
+          echo "Compressed (what actually counts against Artifact Registry's 0.5GB free tier):"
+          docker save analyst:ci | gzip | wc -c | numfmt --to=iec
+
+      - name: Smoke test /health
+        run: |
+          docker run -d --name analyst-smoke -p 8080:8080 analyst:ci
+          sleep 5
+          curl --fail http://localhost:8080/health
+          docker logs analyst-smoke
+          docker stop analyst-smoke
