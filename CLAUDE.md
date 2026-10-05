@@ -20,17 +20,19 @@ security) is complete** — the app is deployed and live at
 details.
 
 **Project direction changed on 2026-08-24.** This repo is no longer heading toward a monetized
-SaaS product. It is now a **Data Engineering portfolio project**, targeting applications from
-~April 2027. The existing multi-agent system becomes the *serving layer* on top of a real data
-platform (ingestion → raw storage → dbt → BigQuery → data quality).
+SaaS product. It is now a **Data Engineering portfolio project**. The existing multi-agent
+system becomes the *serving layer* on top of a real data platform (ingestion → bronze/silver/gold
+lake → BigQuery → data quality). **Phase 6 kickoff (2026-10-03) locked the source and the
+stack:** SEC EDGAR Financial Statement Data Sets, Python + pyarrow ingestion, PySpark + Delta
+Lake transformations (replacing dbt), and BigQuery serving the gold layer only. Reasoning,
+alternatives and the architecture diagram live in `docs/PHASE6_DESIGN.md`.
 
 **Work one phase per chat session.** Read `PHASES.md` first — it is the source of truth for the
 13-phase plan, current status, locked decisions, risk register, and cost limits. Do not re-plan
 or re-litigate settled decisions.
 
-**Current phase:** 6 — Ingestion · **Branch:** `claude/v8-ingestion` (not yet cut). The data
-source for ingestion isn't finalized — confirm with the owner before writing any code (see
-`PHASES.md` Phase 6).
+**Current phase:** 6 — Ingestion (SEC EDGAR → bronze Parquet) · **Branch:**
+`claude/v8-ingestion`. Read `docs/PHASE6_DESIGN.md` before working on this phase.
 
 ## Working agreements
 
@@ -263,7 +265,7 @@ to bite while working in this codebase:
 - **The pipeline is file-path-shaped.** `python_agent` assumes one in-memory dataframe, which
   breaks at warehouse scale. This is the deepest change ahead — Phase 8.
 
-## Current State (Phase 5 complete and deployed, Phase 6 next)
+## Current State (Phase 5 complete and deployed, Phase 6 in progress)
 
 V5 file upload merged to `main` via PR #3 (`3a07c1f`). `POST /upload` accepts CSVs via
 multipart/form-data, saved to `data/uploads/{session_id}.csv`, with a 30-minute session TTL so
@@ -334,3 +336,6 @@ default; `python_agent.execute_code()`'s `exec()` is sandboxed; the `sentence-tr
 split; `Dockerfile` + CI `docker` job; and the actual GCP deploy. **Live at
 `https://agent-1079929934435.us-central1.run.app`**, image 211 MB compressed. Full writeup
 in `PHASES.md` Phase 5.
+
+**Phase 6 (Ingestion), on branch `claude/v8-ingestion`, is in progress.** Source and platform
+stack locked at kickoff (see `docs/PHASE6_DESIGN.md`); ingestion code not yet written.

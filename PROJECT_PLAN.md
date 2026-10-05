@@ -2,9 +2,9 @@
 
 ## Project Vision
 
-A data platform with an AI agent as its serving layer. A public dataset is ingested on a
-schedule, landed in raw storage, modeled through dbt into a warehouse, and checked for data
-quality — and the multi-agent system in this repo (hand-rolled planner, complexity-based
+A data platform with an AI agent as its serving layer. SEC EDGAR financial statement data is
+checked for updates on a schedule, landed as Parquet, transformed with PySpark and Delta Lake,
+served from a BigQuery warehouse, and checked for data quality — and the multi-agent system in this repo (hand-rolled planner, complexity-based
 routing, retry logic) answers natural-language questions against it, alongside its original
 CSV-upload mode.
 
@@ -98,7 +98,7 @@ phase table, to avoid the two documents drifting out of sync with each other.
 See [`PHASES.md`](PHASES.md) for the full 13-phase plan: resurrecting and testing the existing
 system (Phase 1, in progress), a config/DI refactor and CI (Phases 2-3), replacing the
 hardcoded RAG context and adding a real, user-supplied RAG use case (Phases 4-4b), Docker +
-Cloud Run deployment (Phase 5), then the platform work itself — ingestion, dbt, BigQuery,
+Cloud Run deployment (Phase 5), then the platform work itself — ingestion, Spark + Delta Lake, BigQuery,
 Airflow, data quality (Phases 6-10) — followed by a LangGraph comparison, a Streamlit demo, and
 final polish (Phases 11-13).
 
@@ -113,5 +113,5 @@ auth, no tiers — purely so the project is demoable in an interview.
 Current (serving layer): Python, FastAPI, Groq (`openai/gpt-oss-20b` / `openai/gpt-oss-120b`),
 Pandas, FAISS, Sentence Transformers, SQLite, Matplotlib, Tabulate, pytest.
 
-Planned (data platform, see `PHASES.md`): Docker, dbt, BigQuery, Airflow, Great Expectations,
-GCS/Parquet, LangGraph, Streamlit.
+Planned (data platform, see `PHASES.md`): PySpark + Delta Lake, BigQuery, Airflow, Cloud
+Workflows, Great Expectations, GCS/Parquet, LangGraph, Streamlit.

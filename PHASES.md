@@ -4,15 +4,15 @@
 scoped to roughly one weekend at ~10 hrs/week, has its own branch, and ends mergeable. Work
 **one phase per chat session** — read this file first to find the current phase.
 
-**Last updated:** 2026-10-01 · **Current phase:** 6 — Ingestion, not yet started ·
-**Branch:** `claude/v8-ingestion` (not yet cut)
+**Last updated:** 2026-10-05 · **Current phase:** 6 — Ingestion, in progress ·
+**Branch:** `claude/v8-ingestion`
 
 ---
 
 ## Why this plan exists
 
 This repo was heading toward a monetized SaaS product. That direction is dead. It is now
-explicitly a **Data Engineering portfolio piece**, targeting applications from ~April 2027.
+explicitly a **Data Engineering portfolio piece**.
 
 The problem with the previous direction: strip away the LLM layer and the data did almost
 nothing. A CSV was read into in-process SQLite, queried once, and discarded. No ingestion, no
@@ -23,14 +23,16 @@ a competent AI app, not evidence of pipeline engineering.
 of a real platform:
 
 ```
-Public API (source TBD — see Phase 6), ingested on a schedule
-    -> ingestion (Python, orchestrated by Airflow)
-Raw storage (local Parquet / GCS)
-    -> transformation (dbt: staging -> intermediate -> marts)
-Warehouse (BigQuery, free tier)
-    -> data quality (dbt tests + Great Expectations)
-Existing agent queries the marts layer instead of a CSV
+SEC EDGAR Financial Statement Data Sets, checked weekly
+    -> ingestion (Python + pyarrow) into bronze Parquet
+Lake (local / GCS): bronze -> silver -> gold
+    -> transformation (PySpark + Delta Lake)
+Warehouse (BigQuery, free tier): gold only
+    -> data quality (Great Expectations on Spark)
+Existing agent queries the gold layer instead of a CSV
 ```
+
+Decisions, alternatives and the architecture diagram: `docs/PHASE6_DESIGN.md`.
 
 **Preserved and not to be rewritten:** the hand-rolled `PlannerAgent`, complexity-based
 routing, and retry loops. This is the differentiator. Almost every candidate's AI project is
@@ -57,11 +59,11 @@ testing?"
 | 4 | Dynamic data context | `claude/v6.3-data-context` | 1 | Sep 2026 | ✅ Done |
 | 4b | User-supplied RAG context | `claude/v6.4-rag-context` | 1 | Sep 2026 | ✅ Done |
 | 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | ✅ |
-| 6 | Ingestion: source TBD → Parquet | `claude/v8-ingestion` | 1 | Oct 2026 | ⬜ |
-| 7 | dbt + BigQuery: staging → marts | `claude/v9-dbt-bigquery` | 2 | Oct 2026 | ⬜ |
-| 8 | Data-source abstraction; agent reads marts | `claude/v10-warehouse-serving` | 2 | Nov 2026 | ⬜ |
-| 9 | Airflow (Docker) + Cloud Scheduler | `claude/v11-orchestration` | 2 | Nov 2026 | ⬜ |
-| 10 | Data quality: dbt tests + Great Expectations | `claude/v12-data-quality` | 1 | Dec 2026 | ⬜ |
+| 6 | Ingestion: SEC EDGAR → bronze Parquet | `claude/v8-ingestion` | 1 | Oct 2026 | ⬜ |
+| 7 | Spark + Delta Lake: bronze → silver → gold; gold → BigQuery | `claude/v9-spark-lakehouse` | 2 | Oct 2026 | ⬜ |
+| 8 | Data-source abstraction; agent reads gold | `claude/v10-warehouse-serving` | 2 | Nov 2026 | ⬜ |
+| 9 | Airflow (Docker) + Cloud Scheduler + Workflows | `claude/v11-orchestration` | 2 | Nov 2026 | ⬜ |
+| 10 | Data quality: Great Expectations on Spark | `claude/v12-data-quality` | 1 | Dec 2026 | ⬜ |
 | 11 | LangGraph dual implementation | `claude/v13-langgraph` | 1 | Dec 2026 | ⬜ |
 | 12 | Streamlit demo UI | `claude/v14-streamlit` | 1 | Jan 2027 | ⬜ |
 | 13 | Polish: docs, diagrams, ADR log | `claude/v15-polish` | 1 | Jan 2027 | ⬜ |
@@ -289,7 +291,7 @@ both green), ~100+ tests, ≥70% coverage.
 
 ---
 
-## Phase 4 — Dynamic data context ⬜
+## Phase 4 — Dynamic data context ✅
 
 **Branch:** `claude/v6.3-data-context` · **1 weekend**
 
@@ -615,52 +617,56 @@ zero-cost mandate); `/ask` rejects traversal (already true).
 
 **Branch:** `claude/v8-ingestion` · **1 weekend**
 
-### Source: not yet finalized
+### Source: SEC EDGAR Financial Statement Data Sets (decided 2026-10-03)
 
-NYC TLC Trip Record Data was proposed as the leading candidate during initial planning, but
-the owner wants to revisit the choice when this phase actually starts and pick something that
-also suits their own interest — not decide it purely on paper criteria. **Confirm the source
-with the owner before writing any ingestion code.** See the reference memory on this topic for
-the reasoning behind NYC TLC and the other candidates considered (GH Archive, Open-Meteo,
-Alpha Vantage/FRED/World Bank, GBFS).
+Quarterly ZIPs (SUB/NUM/TAG/PRE files) covering every XBRL financial-statement filing since
+2009 — chosen over NYC TLC, Citi Bike, Cricsheet, GH Archive, Binance and others for real
+messiness (restatements, inconsistent concept names, fiscal-year misalignment, a 2024
+full-history republication with a schema change), long-term stability, and the owner's
+interest in finance. Kickoff also replaced dbt with PySpark + Delta Lake for Phases 7–10.
+**Full decisions, alternatives and architecture: `docs/PHASE6_DESIGN.md`** — the reference for
+this phase.
 
-Whatever gets chosen, the same volume-control reasoning applies: BigQuery's free tier is 10 GB
-storage / 1 TB queried per month, so ingest incrementally (one month/period at a time) rather
-than bulk-loading history — both to stay in budget and because incremental ingestion is itself
-part of what Phase 9's orchestration needs to demonstrate.
+Volume control still applies: BigQuery's free tier is 10 GB storage / 1 TB queried per month,
+so the warehouse holds only the compact gold layer, and ingestion is incremental — one quarter
+at a time.
 
-**Added:** `ingestion/` — a per-source module under `sources/`, `storage.py`, `cli.py`
-(`python -m ingestion --source <name> --month 2024-01`), `tests/unit/test_ingestion.py` (~10,
-mocked HTTP — never hits the network). Exact filenames depend on the source chosen.
+**Added:** `ingestion/` (`cli.py`, `storage.py`, `sources/sec_fsds.py`),
+`requirements-ingestion.txt`, and unit tests with mocked HTTP and a fixture ZIP (never the
+network). CLI: `python -m ingestion --source sec_fsds --quarter 2026q2`, plus `--check`.
 
-**Done when:** the CLI ingests one month to partitioned local Parquet, idempotently, with a
-row-count assertion.
+**Done when:** the CLI ingests one quarter to partitioned local bronze Parquet, idempotently,
+with a row-count assertion; one real quarter's row counts and sizes are recorded in
+`docs/PHASE6_DESIGN.md`.
 
 ---
 
-## Phase 7 — dbt + BigQuery ⬜
+## Phase 7 — Spark + Delta Lake lakehouse ⬜
 
-**Branch:** `claude/v9-dbt-bigquery` · **2 weekends**
+**Branch:** `claude/v9-spark-lakehouse` · **2 weekends** (may need a third — learning Spark and
+the SEC format at the same time)
 
-Weekend 1: GCP project, BigQuery dataset, service account, dbt-bigquery connection, raw
-Parquet → BigQuery, `staging` models. Weekend 2: `intermediate` + `marts`, dbt tests, docs,
-lineage graph.
+Weekend 1: local Spark setup on the personal laptop (WSL2, Java 17, PySpark, `delta-spark`),
+fundamentals, bronze → silver on one quarter. Weekend 2: full-history backfill, gold star
+schema, Delta MERGE for restatements, PySpark unit tests in CI, and gold exported to BigQuery
+with free batch loads.
 
-**Added:** `dbt_project/` — `dbt_project.yml`, `profiles.yml.example` (**never commit real
-credentials**), `models/staging/stg_trips.sql`, `models/intermediate/`,
-`models/marts/{fact_trips,dim_zone,dim_vendor}.sql`, `seeds/taxi_zones.csv`, `macros/`, plus
-`docs/DATA_MODEL.md` explaining the star schema.
+**Added (names settled in the phase):** the silver and gold Spark jobs, a concept-mapping seed
+(SEC concept → standard metric), PySpark tests using `pyspark.testing.assertDataFrameEqual`, and
+`docs/DATA_MODEL.md` explaining the star schema (`fct_financials` plus company, metric and
+period dimensions, with company name history as SCD Type 2).
 
-Staging does the cleanup TLC demands: cast types, snake_case renames, filter negative fares,
-drop dropoff-before-pickup rows, standardize the zone join.
+Silver does the cleanup SEC data demands: explicit types, schema differences across years
+(`segments`), the latest-filed value per company/metric/period, standard metric names, and a
+derived Q4.
 
 **⚠️ This is the phase where money is possible.** BigQuery free tier: 10 GB storage, **1 TB
-queried/month**. Storage is fine; query volume is the risk — repeated full-table scans during
-dbt development add up. Before writing the first model: **set a billing budget alert at $1**
-and a BigQuery custom quota (e.g. 50 GB/day), partition `fact_trips` by pickup date, cluster by
-zone, and set `maximum_bytes_billed` in `profiles.yml` as the hard stop.
+queried/month**. Before the first load: confirm the **$1 budget alert** is still active, set a
+BigQuery custom quota (e.g. 50 GB/day), partition gold by period and cluster by company, and set
+`maximum_bytes_billed` on every query.
 
-**Done when:** `dbt build` passes; `dbt docs generate` produces a lineage graph.
+**Done when:** the full history runs through bronze → silver → gold; gold is queryable in
+BigQuery; Spark tests pass in CI.
 
 ---
 
@@ -672,7 +678,7 @@ The deepest architectural change. **The entire request pipeline is file-path-sha
 `analyse(question, file_path)` reads a CSV for `row_count`, then hands `file_path` to agents
 that each re-read it. `python_agent.execute_code` does `pd.read_csv(file_path)` then
 `exec(code, {"df": df})` — the Python agent *fundamentally assumes one in-memory dataframe*.
-Against a 36M-row marts table, "load it all into `df`" is invalid. This is not a
+Against a multi-million-row gold table, "load it all into `df`" is invalid. This is not a
 `database_service` swap; it is a rethink.
 
 **Added:** `src/datasources/` — `base.py` (`DataSource` protocol: `get_schema()`,
@@ -689,7 +695,7 @@ statistic as a population one. `routes/ask.py` gains `POST /warehouse/ask`.
 makes this refactor safe** — say that in an interview.
 
 **Cost guard — non-negotiable:** every agent-issued BigQuery query must set
-`maximum_bytes_billed`. An LLM emitting `SELECT * FROM fact_trips` is exactly how a free tier
+`maximum_bytes_billed`. An LLM emitting `SELECT * FROM fct_financials` is exactly how a free tier
 gets breached.
 
 **Done when:** the same question is answered against both a CSV source and the marts source.
@@ -700,16 +706,18 @@ gets breached.
 
 **Branch:** `claude/v11-orchestration` · **2 weekends**
 
-**Added:** `airflow/dags/nyc_tlc_monthly.py` (ingest → load → `dbt build` → DQ),
-`airflow/docker-compose.yml`, `airflow/README.md` with screenshots for the portfolio;
-`deploy/cloud_run_job.yaml`, a Cloud Scheduler setup script; `tests/unit/test_dags.py` (~6 —
-DAG imports, no cycles, dependencies, retries set).
+**Added:** `airflow/dags/sec_fsds_weekly.py` (check and ingest → Spark job → BigQuery load →
+DQ), `airflow/docker-compose.yml`, `airflow/README.md` with screenshots for the portfolio;
+`deploy/` with the Cloud Run Job definitions (ingestion image in Artifact Registry, Spark image
+on GHCR), a Cloud Workflows definition chaining them, and a Cloud Scheduler setup script;
+`tests/unit/test_dags.py` (~6 — DAG imports, no cycles, dependencies, retries set).
 
-**Windows caveat:** Airflow does not run natively — use **WSL2 + Docker Compose**, and budget
-setup time. Cloud Composer has **no free tier** (~$300+/mo) — do not touch it.
+**Windows caveat:** Airflow does not run natively — use **WSL2 + Docker Compose** (already set
+up on the personal laptop in Phase 5). Cloud Composer has **no free tier** (~$300+/mo) — do not
+touch it.
 
-Deployed path is Cloud Run Jobs + Cloud Scheduler (free tier: 3 jobs). Airflow is the local,
-demonstrable artifact.
+Deployed path: Cloud Scheduler (weekly) → Cloud Workflows → Cloud Run Jobs, all inside free tiers
+(Scheduler: 3 jobs; Workflows: 5,000 steps/month). Airflow is the local, demonstrable artifact.
 
 **Interview answer:** "I built the DAG in Airflow because it's the industry standard and I
 wanted to learn its execution model, but deployed on Cloud Scheduler because Composer costs
@@ -722,13 +730,14 @@ running serverless."
 
 **Branch:** `claude/v12-data-quality` · **1 weekend**
 
-**Added:** dbt schema tests (`not_null`, `unique`, `accepted_values`, `relationships` on the
-zone FK), `dbt_utils.expression_is_true` for fare > 0 and dropoff > pickup,
-`great_expectations/` suite on the raw layer with checkpoints wired into the DAG,
-`docs/DATA_QUALITY.md`, and a `dbt source freshness` step.
+**Added:** Great Expectations suites run inside the Spark job at each layer — bronze (schema
+contract: did the SEC change shape?), silver and gold (`not_null`, uniqueness of company ×
+metric × period, accepted values, and the assets = liabilities + equity identity) — plus
+`docs/DATA_QUALITY.md` and a freshness check (latest quarter ingested vs the SEC's latest
+posting).
 
-**Division of labor to defend:** Great Expectations guards the **raw boundary** (did the source
-change shape?); dbt tests guard the **model** (are my transformation assumptions holding?).
+**Division of labor to defend:** checks at the **raw boundary** catch source changes (did the
+SEC change shape?); checks on **silver and gold** catch broken transformation assumptions.
 
 ---
 
@@ -787,6 +796,13 @@ weight for a portfolio demo; not worth pursuing for the current PNG-returning AP
 Architecture diagram, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` (an ADR log — rare and
 genuinely impressive), README rewrite with both framings, CI + coverage badges. Move
 `src/groq_all_models.py` to `scripts/` or delete it.
+
+**Optional extras (decided 2026-10-03):** a thin dbt or Dataform layer on top of gold, and a
+one-off run of the Spark jobs on Databricks Free Edition to show portability.
+
+**Docs reframe (decided 2026-10-05):** rewrite the docs to focus on the project itself rather
+than career or interview framing — e.g. the "Career framing" section and the "Interview answer"
+notes.
 
 **Candidate pickup — chart data fidelity (deferred from Phase 4, escalated in Phase 5):**
 `docs/BUGS_FOUND.md` findings #10-#12, #15, #16, and **#18** — chart aggregation can silently
@@ -852,7 +868,7 @@ architecture makes assumptions a multi-user product can't share:
   single trusted operator during the portfolio's demo life; a public multi-tenant login
   product raises the stakes on every unresolved security item in the risk register, not just
   this one.
-- **The data platform work itself (Phases 6–10: ingestion, dbt, BigQuery, orchestration, data
+- **The data platform work itself (Phases 6–10: ingestion, Spark, BigQuery, orchestration, data
   quality)** is the actual point of the portfolio pivot — building a login/billing layer before
   that exists would be building SaaS scaffolding around a project that doesn't have its core
   differentiator yet.
@@ -901,6 +917,9 @@ during Phases 1–13.
 | 22 | `openai/gpt-oss-20b`/`120b` (the only free-tier Groq text models — see Phase 1) are not at parity with current frontier models. Fine for this portfolio's purposes (routing/codegen quality is adequate, and the point is demonstrating architecture, not chasing SOTA benchmarks), but worth revisiting once the project is no longer constrained to a single free-tier provider — e.g. if Phase 5+'s deploy step ever adds a paid-tier or alternate-provider option. Raised 2026-09-11 during Phase 4b manual verification — not a defect, a noted future upgrade candidate. | Low | Candidate — revisit post-13 |
 | 23 | RAG's embedding model, `all-MiniLM-L6-v2` (see Phase 5's ONNX swap), is a mid-tier, 2021-era model on MTEB retrieval benchmarks — newer small models (`bge-small-en-v1.5`, `e5-small-v2`, etc.) generally score higher at similar or smaller size. Kept for Phase 5 because (a) this app's actual retrieval task — matching a question against short, plainly-worded, user-authored glossary sentences — is close to the easiest realistic case for any embedding model (validated: the one genuinely-related sentence pair scored 0.76 similarity vs. ~0.0-0.18 for unrelated pairs, an unambiguous gap), (b) it has well-established, battle-tested pre-converted ONNX exports, lowering conversion risk for a phase already doing something new, and (c) model choice is orthogonal to Phase 5's actual done-criteria (deployability/security), so churning it now would mean redoing the quality-parity validation for a change unlikely to be observable in this app's real inputs. Raised 2026-09-17 during the ONNX swap — not a defect, a candidate low-cost upgrade (reuse `scripts/validate_onnx_embedder.py`/`validate_retrieval_threshold.py` against a new candidate model) once the deploy itself is stable. | Low | Candidate — revisit post-5 or ad hoc |
 | 24 | `rag_service.py`'s `split_into_chunks()` splits only on blank-line paragraph breaks and drops anything under 5 words — a single unformatted paragraph becomes one giant chunk, and short-but-real definitions (e.g. "Won = closed-won deal.") can be silently dropped. Raised 2026-10-03 as an idea to have an LLM do the chunking instead; recommendation after discussion: a deterministic improvement (sentence-aware splitting, a small overlap between adjacent chunks, a lower/smarter word floor) fits this project's established "LLM for judgment calls, deterministic code for mechanical work" pattern (see Phase 4's chart-agent redesign) better than an LLM chunking call would. Not a defect — this hasn't caused an observed bad result yet — a candidate improvement. | Low | Candidate — revisit ad hoc |
+| 25 | Phase 7 overrun — learning Spark and the SEC format at the same time | Medium | 7 |
+| 26 | Full-history size (estimated 30–40 GB unzipped) is unverified; measured in Phase 6 Step 6. If it fits comfortably in memory, revisit the larger-than-memory reasoning for Spark (`docs/PHASE6_DESIGN.md` D2) | Low | 6, 7 |
+| 27 | GCP Professional Data Engineer exam (Dec 2026/Jan 2027) competes for the same ~10 hrs/week as Phases 7–9; timeline to be aligned once the exam plan is shared | Medium | 7–9 |
 
 ## Cost summary — free tiers only
 
@@ -908,11 +927,14 @@ during Phases 1–13.
 |---|---|---|
 | Groq | 30 RPM, 1k RPD, 8K TPM, 200k TPD | None — throttled, not billed |
 | BigQuery | 10 GB storage, **1 TB query/month** | **Real** — guard with partitioning, `maximum_bytes_billed`, custom quota, $1 budget alert |
-| GCS | 5 GB, US regions only | Low — keep raw Parquet under 5 GB or stay local |
+| GCS | 5 GB-months, `us-central1`/`us-east1`/`us-west1` only | Low — lake bucket in `us-central1`; `VACUUM` old Delta files; full history stays local |
 | Cloud Run | 2M requests, 360k GB-s/mo | Low — cap `max-instances` |
 | Cloud Scheduler | 3 jobs | None |
-| Artifact Registry | **0.5 GB** | Moderate — a 3.5 GB image exceeds it (pennies, not zero) |
+| Artifact Registry | **0.5 GB** | Low — app image (211 MB) plus a small ingestion image; the Spark image goes on GHCR instead |
+| Cloud Workflows | 5,000 internal steps/month | None — about 10 per run |
+| GitHub Container Registry | Free for public images | None — Spark image is public and holds no secrets |
 | Cloud Composer | **NO FREE TIER** | **Avoid entirely** (~$300+/mo) |
+| Managed Spark (Dataproc), Dataflow | **NO FREE TIER** | **Avoid** — Spark runs on one machine inside Cloud Run Jobs |
 | GitHub Actions | 2,000 min/mo private, unlimited public | None if the repo stays public |
 
 **Set a GCP billing budget alert at $1 before touching BigQuery.** Non-negotiable.

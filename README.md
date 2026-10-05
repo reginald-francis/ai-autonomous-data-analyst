@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/reginald-francis/ai-autonomous-data-analyst/actions/workflows/ci.yml/badge.svg)](https://github.com/reginald-francis/ai-autonomous-data-analyst/actions/workflows/ci.yml)
 
-A data platform with an AI agent as its serving layer. A public dataset is ingested on a
-schedule, landed in raw storage, modeled through dbt into a warehouse, and checked for data
-quality — and the multi-agent system in this repo answers natural-language questions against
+A data platform with an AI agent as its serving layer. SEC EDGAR financial statement data is
+checked for updates on a schedule, landed as Parquet, transformed with PySpark and Delta Lake,
+served from a BigQuery warehouse, and checked for data quality — and the multi-agent system in this repo answers natural-language questions against
 it, alongside its original CSV-upload mode. The agent side is hand-rolled — a planner,
 complexity-based routing, and a retry loop — rather than built on a framework, with built-in
 SQL querying, chart generation, and structured responses.
@@ -45,8 +45,8 @@ extra seconds (cold start).
 - ruff (lint) + GitHub Actions CI — matrix Python 3.11/3.13 (Phase 3)
 - Docker + Google Cloud Run — deployed, Phase 5 (see Live Demo above)
 
-Planned as the platform builds out: dbt, BigQuery, Airflow, Great Expectations,
-LangGraph, Streamlit. See [`PHASES.md`](PHASES.md) for the full plan.
+Planned as the platform builds out: PySpark + Delta Lake, BigQuery, Airflow, Cloud Workflows,
+Great Expectations, LangGraph, Streamlit. See [`PHASES.md`](PHASES.md) for the full plan.
 
 ## Project Phases
 
