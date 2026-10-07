@@ -20,3 +20,6 @@ __pycache__/
 .ruff_cache/
 requirements-dev.txt
 sample_data.csv
+ingestion/
+requirements-ingestion.txt
+data/lake/

@@ -2,10 +2,13 @@
 # so kept out of requirements.txt (which is what the Docker image installs).
 # Local development and CI both install this file instead.
 -r requirements.txt
+# requests comes from requirements-ingestion.txt below — also the one
+# dependency src/groq_all_models.py (a manual diagnostic script) needs,
+# so it's not pinned twice in two files.
+-r requirements-ingestion.txt
 
 pytest==9.1.1
 pytest-cov==7.1.0
 pytest-mock==3.15.1
 coverage==7.15.4
 ruff==0.14.4
-requests==2.34.2  # only src/groq_all_models.py, a manual diagnostic script, uses this

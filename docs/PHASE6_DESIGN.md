@@ -5,8 +5,8 @@ platform's data comes from and how Phases 6–10 process it, plus Phase 6's own 
 `PHASES.md` holds the phase-by-phase plan; this document holds the reasoning behind it, so later
 phases and interview answers don't depend on chat history.
 
-**Status:** decisions D1–D11 locked 2026-10-03/05. Section 5 (ingestion design) is open until
-Phase 6 Step 2 settles it. **Last updated:** 2026-10-05.
+**Status:** decisions D1–D11 locked 2026-10-03/05. Section 5 (ingestion design) locked
+2026-10-06. **Last updated:** 2026-10-06.
 
 ## 1. Why this document exists
 
@@ -263,17 +263,15 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
   revenue.
 - **Exact column definitions:** the SEC's documentation PDF, checked during Step 2.
 
-## 5. Phase 6 ingestion design (open — settled in Step 2)
-
-Each item shows the recommendation; Step 2 confirms or changes it, and this section is updated
-in Step 3's commit.
+## 5. Phase 6 ingestion design (locked 2026-10-06)
 
 1. **Bronze layout:** `data/lake/bronze/sec_fsds/<table>/quarter=2026q2/part-0.parquet`. The
    `quarter=` folder style lets Spark read `quarter` as a column and skip partitions it doesn't
-   need.
+   need. Implemented as `ingestion/storage.py`'s path-building functions.
 2. **Manifest:** one JSON file per quarter, `data/lake/bronze/sec_fsds/_manifests/2026q2.json`,
    holding the source URL, ZIP sha256 and size, row count per table, schema version and load
-   time. One file per quarter keeps every update self-contained.
+   time. One file per quarter keeps every update self-contained. Read/write logic lands in
+   Step 5.
 3. **Change detection:** download, compute sha256, compare with the manifest; identical means
    nothing to do. A cheap header request first (`Content-Length`/`Last-Modified`) can skip the
    download entirely, if the SEC returns those headers reliably — checked in Step 4.
@@ -282,20 +280,31 @@ in Step 3's commit.
    `segments` nullable so older files without it still fit.
 5. **Atomic writes:** write to a temporary folder, verify row counts, then rename into place, so
    a crash never leaves a half-written quarter.
-6. **HTTP client:** `requests` (simple, already pinned in `requirements-dev.txt`) over `httpx`.
-7. **SEC contact header:** a required `SEC_USER_AGENT` environment variable read by ingestion's
-   own config; missing means fail fast. Not added to the app's `src/config.py`, since ingestion
-   is a separate deployable.
-8. **Storage location:** local only in Phase 6, with a configurable root so Phase 9 can point it
-   at `gs://` (pyarrow has a built-in GCS filesystem).
-9. **Raw ZIP retention:** keep the latest ZIP per quarter under `data/lake/landing/`
+6. **HTTP client:** `requests` over `httpx` — simple, and already a real dependency elsewhere in
+   the repo (`src/groq_all_models.py`).
+7. **SEC contact header:** a required `SEC_USER_AGENT` environment variable, read by
+   `ingestion/config.py`; missing means fail fast. Not added to the app's `src/config.py`, since
+   ingestion is a separate deployable with its own environment.
+8. **Storage location:** local only in Phase 6, via `ingestion/config.py`'s configurable
+   `INGESTION_LAKE_ROOT` (default `data/lake`), so Phase 9 can point it at `gs://` without a
+   code change (pyarrow has a built-in GCS filesystem).
+9. **Raw ZIP retention:** keep the latest ZIP per quarter under `data/lake/landing/sec_fsds/`
    (gitignored), so bronze can be rebuilt without re-downloading. Not copied to GCS.
 10. **Choosing quarters:** `--quarter 2026q2`, `--from 2024q1 --to 2026q2`, and `--check` to list
-    new or changed quarters without downloading.
-11. **Dependencies:** a new `requirements-ingestion.txt` (pyarrow, requests), included from
-    `requirements-dev.txt`. `requirements.txt` and the app image stay untouched.
-12. **Tests:** mocked HTTP (`pytest-mock`) and a tiny hand-made fixture ZIP in `tests/data/`;
-    never the network.
+    new or changed quarters without downloading. Argument parsing scaffolded in `ingestion/cli.py`
+    in Step 3; real dispatch lands in Step 6.
+11. **Dependencies:** `requirements-ingestion.txt` (pyarrow, requests), self-contained so Phase
+    9's ingestion container can install it directly. Pulled into `requirements-dev.txt` via `-r`
+    so CI tests ingestion code too; `requirements.txt` and the app image stay untouched.
+12. **Tests (decided 2026-10-06, during Step 2):** `tests/unit/ingestion/` — a subfolder inside
+    the existing `tests/` root, not a separate top-level test tree, so `pytest.ini`'s
+    `testpaths = tests` and the existing `conftest.py` chain keep working unchanged. Fixtures
+    (a tiny hand-built ZIP, never real SEC data) live in `tests/data/ingestion/`. All HTTP calls
+    mocked with `pytest-mock`; never the network.
+13. **CI coverage (decided 2026-10-06):** `ci.yml`'s pytest line gained `--cov=ingestion`
+    alongside `--cov=src`, blended into the same 70% gate — without this, `ingestion/` code could
+    ship with zero test coverage and CI would still pass, since `--cov=src` alone never looks at
+    it.
 
 **Measurements (filled in at Step 6):** rows per table, ZIP size, Parquet size and run time for
 one quarter, plus the extrapolated full-history size against BigQuery's 10 GiB and GCS's 5 GB.

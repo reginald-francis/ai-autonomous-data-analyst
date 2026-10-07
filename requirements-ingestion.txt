@@ -1,0 +1,6 @@
+# Ingestion-only dependencies — kept out of requirements.txt (the deployed
+# app image never runs ingestion) and pulled into requirements-dev.txt via
+# -r, so CI tests ingestion code too. Self-contained: Phase 9's ingestion
+# container installs this file directly, not requirements-dev.txt.
+pyarrow
+requests==2.34.2
