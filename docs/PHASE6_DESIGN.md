@@ -248,10 +248,13 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
   ([SEC page](https://www.sec.gov/data-research/sec-markets-data/financial-statement-data-sets)).
 - **Coverage:** 2009 Q1 – 2026 Q2 at the time of writing — 70 quarterly ZIPs, about 5.4 GB in
   total. Most quarters since 2012 are 60–120 MB.
-- **Files in each ZIP:** `SUB` (one row per filing: company ID/CIK, name, industry code, form
-  type, fiscal year and period, filing date), `NUM` (one row per reported figure: concept name,
-  period end date, duration in quarters, unit, value, `segments`), `TAG` (concept definitions)
-  and `PRE` (where each figure appears in the statements, with the company's own label).
+- **Files in each ZIP** (confirmed 2026-10-08 against a real downloaded ZIP — lowercase,
+  `.txt`, tab-separated): `sub.txt` (one row per filing: company ID/CIK, name, industry code,
+  form type, fiscal year and period, filing date), `num.txt` (one row per reported figure:
+  concept name, period end date, duration in quarters, unit, value, `segments`), `tag.txt`
+  (concept definitions) and `pre.txt` (where each figure appears in the statements, with the
+  company's own label). Each ZIP also contains a `readme.htm` — SEC-authored documentation, not
+  data; explicitly excluded from bronze in Step 5.
 - **Cadence:** quarterly. Filings submitted after a quarter's last business day go into the next
   posting.
 - **December 2024 republication:** the whole history was reposted, limited to the primary
@@ -269,12 +272,35 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
    `quarter=` folder style lets Spark read `quarter` as a column and skip partitions it doesn't
    need. Implemented as `ingestion/storage.py`'s path-building functions.
 2. **Manifest:** one JSON file per quarter, `data/lake/bronze/sec_fsds/_manifests/2026q2.json`,
-   holding the source URL, ZIP sha256 and size, row count per table, schema version and load
-   time. One file per quarter keeps every update self-contained. Read/write logic lands in
-   Step 5.
-3. **Change detection:** download, compute sha256, compare with the manifest; identical means
-   nothing to do. A cheap header request first (`Content-Length`/`Last-Modified`) can skip the
-   download entirely, if the SEC returns those headers reliably — checked in Step 4.
+   holding the source URL, ZIP sha256 and size, `etag`/`last_modified` (as returned by the SEC's
+   server, for item 3's cheap pre-check), row count per table, schema version and load time. One
+   file per quarter keeps every update self-contained. Read/write logic lands in Step 5 — Step 4
+   already reads this schema's `etag`/`last_modified` keys, which stay `None`/absent until
+   Step 5 starts writing real manifests.
+3. **Change detection (two layers, added 2026-10-08 during Step 4 review):**
+   - **Cheap pre-check:** `HEAD` the quarter's URL and compare `ETag`/`Last-Modified` against
+     the manifest, without downloading the body. Implemented as `get_remote_metadata()` +
+     `needs_download()` in `ingestion/sources/sec_fsds.py`. Defaults to "needs download"
+     whenever either side is missing the headers to compare, or the `HEAD` request itself fails
+     — this can only cause an unnecessary download, never a missed change, since it's never the
+     final authority.
+   - **Authoritative check:** download, compute sha256, compare with the manifest — catches a
+     real content change even if the SEC's `ETag`/`Last-Modified` headers are absent, wrong, or
+     a re-packaged ZIP changes without the content inside actually changing (accepted trade-off:
+     this can only cause an unnecessary *re-run*, never a missed change — see risk note below).
+   **URL pattern** (confirmed 2026-10-07): `https://www.sec.gov/files/dera/data/financial-statement-data-sets/<quarter>.zip`,
+   e.g. `.../2026q2.zip` — the owner confirmed this against the real SEC page; assumed consistent
+   back to 2009q1, to be verified against a real older quarter in Step 6.
+3a. **Retry on transient failures (added 2026-10-08, tuned same day after review):**
+    `download_quarter()` retries on `ConnectionError`/`Timeout` and on 5xx responses — never on
+    4xx (e.g. a 404 means the URL/quarter is wrong; retrying can't fix that). Attempt count and
+    backoff are configurable via `ingestion/config.py`
+    (`get_max_download_attempts()`/`get_retry_backoff_seconds()`, env-overridable) rather than
+    hardcoded in `sec_fsds.py` — this is operational policy, not a fact about the SEC's API,
+    the same distinction `BASE_URL`/the quarter regex make in the other direction. Defaults:
+    4 attempts, backoff `2s → 8s → 20s` — widened from an initial `(1, 2)` once review flagged
+    that a real transient server issue typically needs 10-30s to recover, and a weekly,
+    unattended job (Phase 9) loses nothing by being patient rather than fast.
 4. **Schemas:** an explicit pyarrow schema per table, never type inference. Identifiers as
    strings, dates as dates, money as decimals rather than floats where the SEC spec allows;
    `segments` nullable so older files without it still fit.
@@ -284,7 +310,13 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
    the repo (`src/groq_all_models.py`).
 7. **SEC contact header:** a required `SEC_USER_AGENT` environment variable, read by
    `ingestion/config.py`; missing means fail fast. Not added to the app's `src/config.py`, since
-   ingestion is a separate deployable with its own environment.
+   ingestion is a separate deployable with its own environment. **`.env` loading (added
+   2026-10-08, caught by the owner):** `ingestion/config.py` calls `load_dotenv()` at import
+   time, mirroring `src/services/llm_service.py`'s exact pattern — without this, `.env` entries
+   were silently invisible to `python -m ingestion`, since the app's `load_dotenv()` call never
+   runs on the ingestion import path. `python-dotenv` added to `requirements-ingestion.txt`
+   (not just transitively available via `requirements.txt`) to keep it self-contained for
+   Phase 9's standalone ingestion container.
 8. **Storage location:** local only in Phase 6, via `ingestion/config.py`'s configurable
    `INGESTION_LAKE_ROOT` (default `data/lake`), so Phase 9 can point it at `gs://` without a
    code change (pyarrow has a built-in GCS filesystem).
@@ -300,7 +332,16 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
     the existing `tests/` root, not a separate top-level test tree, so `pytest.ini`'s
     `testpaths = tests` and the existing `conftest.py` chain keep working unchanged. Fixtures
     (a tiny hand-built ZIP, never real SEC data) live in `tests/data/ingestion/`. All HTTP calls
-    mocked with `pytest-mock`; never the network.
+    mocked with `pytest-mock`; never the network. **Naming constraint (caught 2026-10-08):**
+    since nowhere in `tests/` has an `__init__.py`, pytest imports every test file as a bare
+    top-level module named after its filename alone — a `tests/unit/ingestion/test_config.py`
+    collided with the existing `tests/unit/test_config.py` (`src/config.py`'s tests), since both
+    resolved to the same module name. Fixed by renaming to `test_ingestion_config.py` rather
+    than adding `__init__.py` files repo-wide (which risked a worse collision: making
+    `tests.unit.ingestion` resolve confusingly close to the real top-level `ingestion` package
+    already on `sys.path`). **Every new file under `tests/unit/ingestion/` needs a basename
+    that's unique across the whole `tests/` tree** — check before naming, don't assume the
+    subfolder provides isolation on its own.
 13. **CI coverage (decided 2026-10-06):** `ci.yml`'s pytest line gained `--cov=ingestion`
     alongside `--cov=src`, blended into the same 70% gate — without this, `ingestion/` code could
     ship with zero test coverage and CI would still pass, since `--cov=src` alone never looks at

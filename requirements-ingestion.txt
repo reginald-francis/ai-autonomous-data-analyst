@@ -4,3 +4,4 @@
 # container installs this file directly, not requirements-dev.txt.
 pyarrow
 requests==2.34.2
+python-dotenv==1.2.1
