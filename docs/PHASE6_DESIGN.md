@@ -6,7 +6,7 @@ platform's data comes from and how Phases 6–10 process it, plus Phase 6's own 
 phases and interview answers don't depend on chat history.
 
 **Status:** decisions D1–D11 locked 2026-10-03/05. Section 5 (ingestion design) locked
-2026-10-06, with Step 4-5 refinements recorded inline. **Last updated:** 2026-10-08.
+2026-10-06, with Step 4-5 refinements recorded inline. **Last updated:** 2026-10-11.
 
 ## 1. Why this document exists
 
@@ -69,6 +69,17 @@ federal agency under a legal mandate — the most stable option considered — a
 course-homework dataset.
 
 **Alternatives considered:**
+- **Financial Statement and Notes Data Sets (FSN)** — the closest alternative, from the same
+  SEC Data Library (which lists ~20 datasets; only FSDS and FSN describe company performance —
+  the rest cover advisers, broker-dealers, fund holdings, capital raising, insider trades and
+  pre-aggregated market statistics). FSN is a superset: it shares FSDS's `adsh` accession
+  numbers and core tables and adds the notes text and dimensional detail. Not chosen because our
+  questions (revenue, margins, growth) sit on the face statements, which FSDS covers at about a
+  fifth of the size: FSN is ~25.6 GB zipped for the full history vs ~5.4 GB (summed from the
+  SEC's listed file sizes, 2026-10-11), in more tables (reported as 8 vs 4, not yet checked) and
+  `.tsv` files rather than `.txt`, and its monthly files are folded into quarterly ones after a
+  year, so a file name isn't a stable identity. Honest counterpoint: FSN updates monthly where
+  FSDS is quarterly. Kept as a candidate extension for segment-level revenue — see `PHASES.md`.
 - **NYC TLC trip data** — the original leading candidate and the lowest-risk option, but it is
   the dataset the DataTalksClub Data Engineering Zoomcamp uses throughout, including its Spark
   module, with the same tools. The platform half would read as course homework.

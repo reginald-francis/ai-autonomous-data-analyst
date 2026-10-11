@@ -829,6 +829,60 @@ done-criterion depends on it — revisit at Phase 13, or sooner if convenient.
 
 ---
 
+## Candidate extension — FSN segment/notes data (not scheduled)
+
+Added 2026-10-11 after comparing the SEC Data Library's ~20 datasets with our choice (see
+`docs/PHASE6_DESIGN.md` D1). Only two describe company performance: FSDS (what we ingest) and
+the **Financial Statement and Notes Data Sets (FSN)**, a superset sharing FSDS's `adsh`
+accession numbers and core tables.
+
+**Would unlock:** the notes text and dimensional detail behind the face statements —
+potentially segment- and product-level revenue, which FSDS can't answer.
+
+**Questions it would make answerable** (FSDS today answers reported totals — revenue, profit,
+margins, assets, cash flow — across companies and years, and their trends). The list below is
+what XBRL notes typically contain; confirm against the real files before scoping:
+- *Where does the money come from?* Revenue by segment, product line or geography — "How much
+  of Company X's revenue is from outside the US?", "Which segment grew fastest?"
+- *What does it owe, and when?* Debt maturities, interest rates, lease obligations — "When
+  does Company X's debt come due?"
+- *How good are the earnings?* Stock-based compensation, tax-rate reconciliation, one-off
+  charges — "Did profit grow because of lower taxes rather than operations?"
+- *How concentrated is the business?* Reliance on a few customers or suppliers.
+- *What does the text say?* Accounting-policy changes, going-concern warnings, lawsuits and
+  other contingencies — "Which companies disclosed going-concern doubt this year?"
+- *Combined with FSDS* (same `adsh`): totals from FSDS next to the breakdown from FSN — "Is the
+  fastest-growing segment also the most profitable?"
+
+**Still out of reach with both:** stock prices and valuation (neither dataset has prices, so
+neither answers "is the stock cheap?"), analyst forecasts, and companies that don't file with
+the SEC. They support research on reported results, not investment advice.
+
+**Costs:**
+- ~5x the volume: ~25.6 GB zipped for the full history (summed from the SEC's listed file sizes
+  on 2026-10-11) vs FSDS's ~5.4 GB; recent quarters run 4.5-5.5x.
+- 8 tables vs 4, in `.tsv` files rather than `.txt` — confirmed from a real 2026-08 monthly
+  ZIP: `cal`, `dim`, `num`, `pre`, `ren`, `sub`, `tag`, `txt`, plus `notes-metadata.json` and
+  `readme.htm`. New schemas and a new bronze reader, not a config change.
+- The SEC folds monthly files into quarterly ones after a year, so a file name isn't a stable
+  identity — manifests would have to key on content (sha256), not file name.
+- Dimensional metadata that needs decoding (`dimh`) before segments are usable — unchecked.
+- Far bigger once unzipped: that one month is 298 MB zipped but ~2.4 GB unzipped (`num.tsv`
+  alone 1.1 GB, `txt.tsv` 0.6 GB), so the full history is on the order of 200 GB unzipped
+  (extrapolated from one month) — unlikely to fit the free tiers whole, so an extension would
+  probably ingest a window of recent months.
+
+**Also brings:** fresher data — FSN updates monthly (since Nov 2020), FSDS quarterly. Our
+questions don't need it (D11), but it is a real difference.
+
+**Verify before scoping:** `dimh` decoding and what `dim.tsv`/`txt.tsv` actually hold (FSN's
+documentation PDF and the real files), and that segment/product revenue is recoverable from
+them — the question list above is expectation, not yet checked.
+
+**Status:** not scheduled; revisit after Phase 10.
+
+---
+
 ## Candidate Phase 14 — eval harness
 
 Not scheduled. Golden-question sets, routing-accuracy measurement, regression detection on
