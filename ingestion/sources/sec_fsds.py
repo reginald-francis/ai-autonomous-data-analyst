@@ -7,12 +7,11 @@ Assumed consistent across the full 2009q1-present history — the owner
 confirmed the 2026q2 link directly; older quarters are verified in Step 6
 when a real range gets ingested.
 
-Converting a downloaded ZIP into bronze Parquet lands in Step 5 — this
-module only downloads and detects whether a quarter is new or changed.
+Converting a downloaded ZIP into bronze Parquet lives in sec_fsds_bronze.py —
+this module only downloads and detects whether a quarter is new or changed.
 """
 
 import hashlib
-import json
 import os
 import re
 import time
@@ -146,7 +145,7 @@ def needs_download(quarter: str, lake_root: str, user_agent: str) -> bool:
     missed one - has_quarter_changed()'s full sha256 comparison after a real
     download remains the authoritative check.
     """
-    existing = read_manifest(lake_root, quarter)
+    existing = storage.read_manifest(lake_root, quarter)
     if existing is None:
         return True
 
@@ -175,15 +174,6 @@ def sha256_of_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def read_manifest(lake_root: str, quarter: str) -> dict | None:
-    """Return a quarter's existing manifest dict, or None if none exists yet."""
-    path = storage.manifest_path(lake_root, quarter)
-    if not os.path.exists(path):
-        return None
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
 def has_quarter_changed(quarter: str, zip_path: str, lake_root: str) -> bool:
     """True if this quarter has never been ingested, or its freshly downloaded
     ZIP's hash differs from the one recorded in the existing manifest - e.g.
@@ -192,7 +182,7 @@ def has_quarter_changed(quarter: str, zip_path: str, lake_root: str) -> bool:
     after a real download - unlike needs_download()'s cheap header pre-check,
     this always correctly detects a real content change.
     """
-    existing = read_manifest(lake_root, quarter)
+    existing = storage.read_manifest(lake_root, quarter)
     if existing is None:
         return True
     return sha256_of_file(zip_path) != existing.get("sha256")

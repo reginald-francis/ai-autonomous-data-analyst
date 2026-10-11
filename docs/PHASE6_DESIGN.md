@@ -6,7 +6,7 @@ platform's data comes from and how Phases 6–10 process it, plus Phase 6's own 
 phases and interview answers don't depend on chat history.
 
 **Status:** decisions D1–D11 locked 2026-10-03/05. Section 5 (ingestion design) locked
-2026-10-06. **Last updated:** 2026-10-06.
+2026-10-06, with Step 4-5 refinements recorded inline. **Last updated:** 2026-10-08.
 
 ## 1. Why this document exists
 
@@ -264,7 +264,14 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
   User-Agent with a name and contact email; at most 10 requests per second; no crawling.
 - **What it can't answer:** stock prices or valuation, private companies, detailed product-level
   revenue.
-- **Exact column definitions:** the SEC's documentation PDF, checked during Step 2.
+- **Exact column definitions:** confirmed 2026-10-08 directly against a real downloaded ZIP's
+  header rows (not just the SEC's documentation) — see the four schemas in Step 5. A snapshot of
+  the SEC's own field-definitions document is kept verbatim (not converted to Markdown, to avoid
+  losing table formatting) at
+  [`docs/sec_fsds_readme_2026q2.htm`](sec_fsds_readme_2026q2.htm), copied in manually rather than
+  by ingestion code (which deliberately treats `readme.htm` as documentation, not data — see
+  item 4 of section 4 below). Not kept in automated sync with future SEC updates; re-copy
+  manually if the SEC changes the schema again.
 
 ## 5. Phase 6 ingestion design (locked 2026-10-06)
 
@@ -274,9 +281,8 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
 2. **Manifest:** one JSON file per quarter, `data/lake/bronze/sec_fsds/_manifests/2026q2.json`,
    holding the source URL, ZIP sha256 and size, `etag`/`last_modified` (as returned by the SEC's
    server, for item 3's cheap pre-check), row count per table, schema version and load time. One
-   file per quarter keeps every update self-contained. Read/write logic lands in Step 5 — Step 4
-   already reads this schema's `etag`/`last_modified` keys, which stay `None`/absent until
-   Step 5 starts writing real manifests.
+   file per quarter keeps every update self-contained. Read/write lives in `ingestion/storage.py`
+   (Step 5); writes are atomic (`.tmp`, then `os.replace`).
 3. **Change detection (two layers, added 2026-10-08 during Step 4 review):**
    - **Cheap pre-check:** `HEAD` the quarter's URL and compare `ETag`/`Last-Modified` against
      the manifest, without downloading the body. Implemented as `get_remote_metadata()` +
@@ -301,11 +307,40 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
     4 attempts, backoff `2s → 8s → 20s` — widened from an initial `(1, 2)` once review flagged
     that a real transient server issue typically needs 10-30s to recover, and a weekly,
     unattended job (Phase 9) loses nothing by being patient rather than fast.
-4. **Schemas:** an explicit pyarrow schema per table, never type inference. Identifiers as
-   strings, dates as dates, money as decimals rather than floats where the SEC spec allows;
-   `segments` nullable so older files without it still fit.
-5. **Atomic writes:** write to a temporary folder, verify row counts, then rename into place, so
-   a crash never leaves a half-written quarter.
+4. **Schemas (implemented 2026-10-08 in `ingestion/sources/sec_fsds_schema.py`):** an explicit
+   pyarrow schema per table, never type inference, transcribed from the SEC's own field
+   definitions (`docs/sec_fsds_readme_2026q2.htm`, Figures 2-5). Each field also records the
+   SEC's format, max size, "May be NULL" and key, so Phase 7's MERGE keys and Phase 10's checks
+   read from the same place. Decisions made against the spec:
+   - **Followed the spec:** `value` as `decimal128(28, 4)` (the spec's `NUMERIC(28,4)`, exact
+     rather than float); the SEC's `BOOLEAN (1/0)` flags as `bool`; `DATE (yyyymmdd)` fields as
+     `date32`; `accepted` as `timestamp(ms)`; `fye` kept a string (`ALPHANUMERIC (mmdd)` —
+     `"0630"` would become `630` as an integer); `changed` kept a string because the spec lists
+     it as `ALPHANUMERIC`, unlike `period`/`filed`.
+   - **Deliberately deviated:** `cik`, `sic`, `ein` are `NUMERIC` in the spec but stored as
+     strings — they're identifiers/codes, and a leading zero in the source text (SIC codes
+     0100-0999 exist; EINs can start with 0) would be silently dropped by integer parsing. To
+     revisit after Step 6 inspects real values; switching later is a `SCHEMA_VERSION` bump,
+     or a cast in silver.
+   - **Nullability recorded, not enforced:** every bronze field is nullable, so data lands
+     exactly as published; enforcing the SEC's "May be NULL: No" belongs to Phase 10.
+   - **`SCHEMA_VERSION`:** recorded in every manifest; bumping it makes the bronze writer
+     rebuild each quarter from its landing ZIP, with no re-download.
+   **Reader settings** (in `ingestion/sources/sec_fsds_bronze.py`): tab-delimited, quoting
+   disabled (the spec's files are unquoted, so `"` is ordinary text); **only an empty field is
+   NULL** — pyarrow's defaults would also null out `"NA"`, which is Namibia's ISO country code;
+   whitespace trimmed before converting non-text fields only (text is kept byte-for-byte);
+   streamed in batches so memory stays bounded however large `num.txt` is; Parquet compressed
+   with zstd. A header that doesn't match the schema (new, missing or duplicated columns) fails
+   loudly, except `segments`, which is filled with nulls if absent.
+5. **Atomic writes (implemented 2026-10-08):** all four tables are written into
+   `_staging/<quarter>/` and row-checked first, then moved into their partitions
+   (`os.replace`, atomic per file), and the manifest is written **last** as the commit marker.
+   Any failure before that leaves the previous manifest in place, so the next run sees the
+   quarter as changed and rebuilds it — a failed rebuild never corrupts the last good build.
+   Row counts are checked against an independent count of each source file's data lines.
+   A re-run is a no-op when the manifest's sha256 and `SCHEMA_VERSION` match and all four
+   files exist; `force=True` rebuilds anyway.
 6. **HTTP client:** `requests` over `httpx` — simple, and already a real dependency elsewhere in
    the repo (`src/groq_all_models.py`).
 7. **SEC contact header:** a required `SEC_USER_AGENT` environment variable, read by
@@ -331,8 +366,11 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
 12. **Tests (decided 2026-10-06, during Step 2):** `tests/unit/ingestion/` — a subfolder inside
     the existing `tests/` root, not a separate top-level test tree, so `pytest.ini`'s
     `testpaths = tests` and the existing `conftest.py` chain keep working unchanged. Fixtures
-    (a tiny hand-built ZIP, never real SEC data) live in `tests/data/ingestion/`. All HTTP calls
-    mocked with `pytest-mock`; never the network. **Naming constraint (caught 2026-10-08):**
+    are synthetic (fake companies, never real SEC data). **Changed in Step 5:** rather than a
+    binary ZIP checked into `tests/data/ingestion/`, the bronze tests build a tiny ZIP at test
+    time from Python-defined rows — the tab-separated content is then exact and readable in
+    code review, there's no binary blob in git, and each test can vary just the row it needs.
+    All HTTP calls mocked with `pytest-mock`; never the network. **Naming constraint (caught 2026-10-08):**
     since nowhere in `tests/` has an `__init__.py`, pytest imports every test file as a bare
     top-level module named after its filename alone — a `tests/unit/ingestion/test_config.py`
     collided with the existing `tests/unit/test_config.py` (`src/config.py`'s tests), since both
