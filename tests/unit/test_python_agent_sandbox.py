@@ -112,11 +112,15 @@ def _run_hanging_code_and_report(csv_path, result_queue):
     session. Reports the outcome back via a Queue since the parent can't
     just inspect a raised exception across the process boundary."""
     agent = PythonAgent(client=object())
+    # Timed here, inside the child, so process start-up isn't counted against
+    # execute_code()'s own timeout: on Windows a "spawn" child re-imports
+    # pandas etc., which can take seconds on a busy machine.
+    start = time.monotonic()
     try:
         agent.execute_code("while True:\n    pass", csv_path)
-        result_queue.put(("no_exception", None))
+        result_queue.put(("no_exception", None, time.monotonic() - start))
     except Exception as e:
-        result_queue.put(("raised", str(e)))
+        result_queue.put(("raised", str(e), time.monotonic() - start))
 
 
 def test_timeout_on_hanging_code(csv_path):
@@ -125,16 +129,20 @@ def test_timeout_on_hanging_code(csv_path):
         target=_run_hanging_code_and_report, args=(csv_path, result_queue)
     )
 
-    start = time.time()
     process.start()
-    process.join(EXEC_TIMEOUT_SECONDS + 5)
-    elapsed = time.time() - start
-
-    assert elapsed < EXEC_TIMEOUT_SECONDS + 5, "execute_code()'s own timeout should fire first"
-
-    outcome, detail = result_queue.get(timeout=1)
-    process.terminate()  # the child's zombie worker thread dies with it
-    process.join()
+    try:
+        # The generous timeout only guards against a genuinely hung child (e.g.
+        # execute_code()'s timeout never firing). The real assertion below is on
+        # the time measured inside the child, not on wall-clock time out here.
+        outcome, detail, elapsed = result_queue.get(timeout=EXEC_TIMEOUT_SECONDS + 60)
+    finally:
+        # Always runs - previously a failed assertion skipped this and leaked
+        # the child, with its spinning thread, for the rest of the session.
+        process.terminate()  # the child's zombie worker thread dies with it
+        process.join()
 
     assert outcome == "raised"
     assert "time limit" in detail
+    assert EXEC_TIMEOUT_SECONDS - 0.5 <= elapsed < EXEC_TIMEOUT_SECONDS + 5, (
+        "execute_code()'s own timeout should fire at about EXEC_TIMEOUT_SECONDS"
+    )
