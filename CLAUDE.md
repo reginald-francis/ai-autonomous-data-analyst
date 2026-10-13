@@ -6,9 +6,9 @@ data-platform decisions, ingestion design and real-data measurements.
 
 ## Status
 
-**Phases 1-6 are done.** Phase 6 (SEC EDGAR ingestion into bronze Parquet) is complete on branch
-`claude/v8-ingestion`, PR to `main` pending. **Next: Phase 7** — Spark + Delta Lake (silver/gold),
-branch `claude/v9-spark-lakehouse`, not yet cut. Work one phase per chat session; do not re-plan or
+**Phases 1-6 are done.** Phase 6 (SEC EDGAR ingestion into bronze Parquet) is complete and
+merged to `main` (PR #10). **Current: Phase 7** — Spark + Delta Lake (silver/gold), in progress
+on branch `claude/v9-spark-lakehouse`. Work one phase per chat session; do not re-plan or
 re-litigate settled decisions.
 
 This is a **Data Engineering portfolio project** (monetization dropped 2026-08-24). A hand-rolled

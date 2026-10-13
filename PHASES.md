@@ -4,8 +4,8 @@
 scoped to roughly one weekend at ~10 hrs/week, has its own branch, and ends mergeable. Work
 **one phase per chat session** — read this file first to find the current phase.
 
-**Last updated:** 2026-10-13 · **Current phase:** 6 — Ingestion, done on `claude/v8-ingestion`
-(PR to `main` pending) · **Next:** 7 — `claude/v9-spark-lakehouse` (not yet cut)
+**Last updated:** 2026-10-13 · **Current phase:** 7 — Spark + Delta Lake, in progress on
+`claude/v9-spark-lakehouse` · **Done:** 1-6 (Phase 6 merged to `main`)
 
 ---
 
@@ -58,7 +58,7 @@ testing?"
 | 3 | API + integration tests, CI | `claude/v6.2-ci` | 1 | Sep 2026 | ✅ Done |
 | 4 | Dynamic data context | `claude/v6.3-data-context` | 1 | Sep 2026 | ✅ Done |
 | 4b | User-supplied RAG context | `claude/v6.4-rag-context` | 1 | Sep 2026 | ✅ Done |
-| 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | ✅ |
+| 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | ✅ Done |
 | 6 | Ingestion: SEC EDGAR → bronze Parquet | `claude/v8-ingestion` | 1 | Oct 2026 | ✅ Done |
 | 7 | Spark + Delta Lake: bronze → silver → gold; gold → BigQuery | `claude/v9-spark-lakehouse` | 2 | Oct 2026 | ⬜ |
 | 8 | Data-source abstraction; agent reads gold | `claude/v10-warehouse-serving` | 2 | Nov 2026 | ⬜ |
@@ -615,7 +615,7 @@ zero-cost mandate); `/ask` rejects traversal (already true).
 
 ## Phase 6 — Ingestion ✅
 
-**Branch:** `claude/v8-ingestion` · **1 weekend** · **Completed 2026-10-13** (PR to `main` pending)
+**Branch:** `claude/v8-ingestion` · **1 weekend** · **Completed 2026-10-13** (merged to `main`, PR #10)
 
 ### Source: SEC EDGAR Financial Statement Data Sets (decided 2026-10-03)
 

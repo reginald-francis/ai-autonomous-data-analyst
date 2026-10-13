@@ -12,7 +12,7 @@ questions against it, alongside its original CSV-upload mode.
 
 The multi-agent serving layer (V1 through V5 below) is complete and deployed. **Phases 1-6 of
 the data platform build are done** — Phase 6, SEC EDGAR ingestion into bronze Parquet, is
-awaiting its PR to `main` — and Phase 7 (Spark + Delta Lake) is next.
+merged to `main` — and Phase 7 (Spark + Delta Lake) is in progress.
 
 The full 13-phase plan, current status, locked architectural decisions, risk register, and
 cost limits live in **[`PHASES.md`](PHASES.md)** — that file is the source of truth going
