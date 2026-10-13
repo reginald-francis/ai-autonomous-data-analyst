@@ -2,16 +2,17 @@
 
 ## Project Vision
 
-A data platform with an AI agent as its serving layer. A public dataset is ingested on a
-schedule, landed in raw storage, modeled through dbt into a warehouse, and checked for data
-quality — and the multi-agent system in this repo (hand-rolled planner, complexity-based
-routing, retry logic) answers natural-language questions against it, alongside its original
-CSV-upload mode.
+A data platform with an AI agent as its serving layer. SEC EDGAR financial statement data is
+checked for updates on a schedule, landed as Parquet, transformed with PySpark and Delta Lake,
+served from a BigQuery warehouse, and checked for data quality — and the multi-agent system in
+this repo (hand-rolled planner, complexity-based routing, retry logic) answers natural-language
+questions against it, alongside its original CSV-upload mode.
 
 ## Current Status
 
-The multi-agent serving layer (V1 through V5 below) is complete. **Phase 1 of the data
-platform build is in progress.**
+The multi-agent serving layer (V1 through V5 below) is complete and deployed. **Phases 1-6 of
+the data platform build are done** — Phase 6, SEC EDGAR ingestion into bronze Parquet, is
+awaiting its PR to `main` — and Phase 7 (Spark + Delta Lake) is next.
 
 The full 13-phase plan, current status, locked architectural decisions, risk register, and
 cost limits live in **[`PHASES.md`](PHASES.md)** — that file is the source of truth going
@@ -95,12 +96,12 @@ phase table, to avoid the two documents drifting out of sync with each other.
 
 ## What comes next
 
-See [`PHASES.md`](PHASES.md) for the full 13-phase plan: resurrecting and testing the existing
-system (Phase 1, in progress), a config/DI refactor and CI (Phases 2-3), replacing the
-hardcoded RAG context and adding a real, user-supplied RAG use case (Phases 4-4b), Docker +
-Cloud Run deployment (Phase 5), then the platform work itself — ingestion, dbt, BigQuery,
-Airflow, data quality (Phases 6-10) — followed by a LangGraph comparison, a Streamlit demo, and
-final polish (Phases 11-13).
+See [`PHASES.md`](PHASES.md) for the full 13-phase plan. Done: resurrecting and testing the
+existing system (Phase 1), a config/DI refactor and CI (Phases 2-3), replacing the hardcoded RAG
+context with a real, user-supplied RAG use case (Phases 4-4b), Docker + Cloud Run deployment
+(Phase 5), and SEC EDGAR ingestion into bronze Parquet (Phase 6). Next: the Spark + Delta Lake
+lakehouse and BigQuery serving (Phases 7-8), then orchestration and data quality (Phases 9-10) —
+followed by a LangGraph comparison, a Streamlit demo, and final polish (Phases 11-13).
 
 ## Out of scope
 
@@ -111,7 +112,11 @@ auth, no tiers — purely so the project is demoable in an interview.
 ## Tech Stack
 
 Current (serving layer): Python, FastAPI, Groq (`openai/gpt-oss-20b` / `openai/gpt-oss-120b`),
-Pandas, FAISS, Sentence Transformers, SQLite, Matplotlib, Tabulate, pytest.
+Pandas, FAISS, onnxruntime + tokenizers (quantized ONNX embeddings), SQLite, Matplotlib,
+Tabulate, pytest, Docker, Google Cloud Run.
 
-Planned (data platform, see `PHASES.md`): Docker, dbt, BigQuery, Airflow, Great Expectations,
-GCS/Parquet, LangGraph, Streamlit.
+Current (data platform): Python + pyarrow ingestion of the SEC EDGAR Financial Statement Data
+Sets into bronze Parquet.
+
+Planned (data platform, see `PHASES.md`): PySpark + Delta Lake, BigQuery, Airflow, Cloud
+Workflows, Great Expectations, GCS, LangGraph, Streamlit.

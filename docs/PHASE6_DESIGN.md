@@ -1,0 +1,525 @@
+# Phase 6 design — SEC EDGAR source and the data platform architecture
+
+**Scope of this document:** the decisions made at Phase 6 kickoff (2026-10-03) about where the
+platform's data comes from and how Phases 6–10 process it, plus Phase 6's own ingestion design.
+`PHASES.md` holds the phase-by-phase plan; this document holds the reasoning behind it, so later
+phases and interview answers don't depend on chat history.
+
+**Status:** decisions D1–D11 locked 2026-10-03/05. Section 5 (ingestion design) locked
+2026-10-06, with Step 4-6 refinements recorded inline. **Last updated:** 2026-10-13.
+
+## 1. Why this document exists
+
+Phase 6 is where the data platform starts. The source chosen here fixes Phase 7's data model,
+Phase 8's demo questions, Phase 9's schedule and Phase 10's quality rules. The kickoff
+discussion also changed the architecture itself: PySpark and Delta Lake replace dbt as the
+transformation layer. Both decisions are expensive to revisit later, so the reasoning lives here.
+
+## 2. Architecture
+
+![Platform architecture](diagrams/platform_architecture.png)
+
+Diagram source: [`diagrams/platform_architecture.mmd`](diagrams/platform_architecture.mmd).
+Edit the source, then regenerate the PNG (section 8).
+
+**Components and their purpose:**
+
+- **Ingestion job** (Phase 6) — Python + pyarrow. Checks the SEC page for new or changed
+  quarters, downloads only those, converts the four files to Parquet with an explicit schema,
+  and records a manifest (file hash, row counts). Re-running an unchanged quarter does nothing.
+  No Java, so the image stays small.
+- **Lake** — the bronze, silver and gold tables. Local disk during development; a GCS bucket in
+  `us-central1` in production (Phase 9), since Cloud Run Jobs keep nothing between runs.
+- **Spark job** (Phase 7) — PySpark + Delta Lake. All transformation logic: merging schema
+  changes across years, resolving restatements, standardising metric names, deriving Q4,
+  tracking company name history and building the star schema. Spark runs in local mode (one
+  machine, all cores) — on the laptop during development, inside a Cloud Run Job in production.
+- **Great Expectations** (Phase 10) — checks inside the Spark job at every layer: structure at
+  bronze; uniqueness, accepted values and the assets = liabilities + equity identity at silver
+  and gold.
+- **BigQuery** (Phases 7–8) — holds only the compact gold layer, loaded from a Parquet export
+  with free batch loads. Partitioned and clustered; every agent query is capped with
+  `maximum_bytes_billed`.
+- **Serving** (existing) — the FastAPI app and agents on Cloud Run, answering both CSV uploads
+  and warehouse questions through Phase 8's `DataSource` abstraction. Spark never runs inside a
+  user request.
+- **Cloud Scheduler + Cloud Workflows** (Phase 9) — a weekly trigger; Workflows runs ingest,
+  transform and load in order, and stops at the first failure or when ingestion finds nothing
+  new.
+- **Airflow** (Phase 9) — the same pipeline as a DAG, run locally in Docker as the portfolio
+  artifact. Not deployed: Cloud Composer has no free tier.
+- **GitHub Actions** — lint, all tests including PySpark unit tests, and image builds. The Spark
+  image is published publicly on GitHub Container Registry (GHCR); small images go to Artifact
+  Registry.
+
+## 3. Decisions
+
+### D1 — Source: SEC EDGAR Financial Statement Data Sets
+
+**Requirements any source had to meet:** free with no API key or card; published in time
+periods, so ingestion can be incremental; tens of millions of rows available; genuinely messy;
+likely still online in April 2027.
+
+**Why SEC:** it meets all five and matches the owner's interest in finance, products and
+revenue. Its problems are the ones analytics teams really face: the same figure reported under
+different concept names, prior years re-reported and restated in every annual report, fiscal
+years ending in different months, no fourth-quarter filing (Q4 has to be derived), and a
+full-history republication with a schema change in December 2024. It is published by a US
+federal agency under a legal mandate — the most stable option considered — and it isn't a
+course-homework dataset.
+
+**Alternatives considered:**
+- **Financial Statement and Notes Data Sets (FSN)** — the closest alternative, from the same
+  SEC Data Library (which lists ~20 datasets; only FSDS and FSN describe company performance —
+  the rest cover advisers, broker-dealers, fund holdings, capital raising, insider trades and
+  pre-aggregated market statistics). FSN is a superset: it shares FSDS's `adsh` accession
+  numbers and core tables and adds the notes text and dimensional detail. Not chosen because our
+  questions (revenue, margins, growth) sit on the face statements, which FSDS covers at about a
+  fifth of the size: FSN is ~25.6 GB zipped for the full history vs ~5.4 GB (summed from the
+  SEC's listed file sizes, 2026-10-11), in more tables (reported as 8 vs 4, not yet checked) and
+  `.tsv` files rather than `.txt`, and its monthly files are folded into quarterly ones after a
+  year, so a file name isn't a stable identity. Honest counterpoint: FSN updates monthly where
+  FSDS is quarterly. Kept as a candidate extension for segment-level revenue — see `PHASES.md`.
+- **NYC TLC trip data** — the original leading candidate and the lowest-risk option, but it is
+  the dataset the DataTalksClub Data Engineering Zoomcamp uses throughout, including its Spark
+  module, with the same tools. The platform half would read as course homework.
+- **Citi Bike trip history** — TLC's strengths without the cliché; the best fallback.
+- **Cricsheet** — distinctive, but a few million rows in total: too small to justify a warehouse.
+- **GH Archive** — a single day is gigabytes, and the payloads are deeply nested JSON: more
+  parsing than modelling.
+- **Binance public market data** — excellent cadence and built-in checksums, but a thin data
+  model, mostly structural messiness, untested access from corporate networks and GCP, and a
+  single commercial exchange as the dependency.
+- **Stock prices, FRED, CoinGecko** — API keys, unofficial scrapers that break, or low volume.
+- **E-commerce product datasets** — static Kaggle snapshots or synthetic data.
+
+### D2 — PySpark is the transformation engine; dbt is dropped
+
+**Why a larger-than-memory engine is required:** the full SEC history (roughly 45–65 GB
+unzipped, extrapolated from one measured quarter - see section 5) is larger than the memory of any machine this project runs on —
+a laptop or a Cloud Run job — and pandas would need several times that in RAM. Resolving
+restatements also needs every quarter at once: a regrouping across all of history, not a
+quarter-at-a-time job.
+
+**Why Spark among those engines:**
+- **It scales out without rewriting the pipeline.** The same transformation code runs on one
+  machine today and on a cluster (Dataproc, Databricks, EMR) as history grows; single-machine
+  engines are capped by one machine's disk and CPU.
+- **Delta Lake support.** The restatement logic depends on MERGE, time travel and schema
+  evolution, and Spark has the most mature Delta Lake implementation.
+- **Testable transformations.** Schema changes across file versions, restatement merges and
+  company name history are easier to unit-test as PySpark functions than as SQL.
+- **It's the industry-standard engine for large batch processing,** and understanding it
+  properly — partitioning, shuffles, joins, table formats — is one of this project's goals.
+
+**Why not dbt:** dbt runs SQL inside the warehouse, and the warehouse here can't hold the full
+history for free. If all the data lived in BigQuery, gold would be a natural fit for dbt or
+Dataform.
+
+**Trade-off acknowledged:** at today's size, a single-machine engine like DuckDB would probably
+run this job faster than Spark on one machine. The design accepts that in exchange for the
+scale-out path and Delta Lake's features.
+
+**Alternatives considered:**
+- **dbt or Dataform in BigQuery** — the right choice if all the data lived in the warehouse;
+  here the free tier can't hold the full history.
+- **pandas** — loads everything into memory; the full history doesn't fit.
+- **DuckDB or Polars** — single-machine engines that handle larger-than-memory data and are
+  likely faster at today's size, but capped by one machine as history grows, with less mature
+  Delta Lake support.
+- **Dataflow (Apache Beam)** — GCP-native and serverless, but no free tier, and Beam's strength
+  is streaming.
+- **Managed Spark (Dataproc, Databricks)** — what production would use, running the same code.
+  Dataproc has no free tier ([$0.06 per compute-unit hour](https://cloud.google.com/dataproc-serverless/pricing)).
+  [Databricks Free Edition](https://docs.databricks.com/gcp/en/getting-started/free-edition-limitations)
+  has no SLA and shuts compute off for the day when its quota runs out — not acceptable behind a
+  public app.
+- **Spark for bronze/silver plus dbt for gold** — keeps both tools, but under the 10 GiB limit
+  dbt would only get a small layer to work on, and it costs about one more weekend. Kept as an
+  optional Phase 13 extra (dbt or Dataform).
+
+### D3 — Medallion layers
+
+- **Bronze** — an exact copy of what the SEC published, as Parquet, one partition per quarter,
+  plus ingestion metadata (source URL, file hash, load time). Never edited, so everything
+  downstream can always be rebuilt from it. Written by Phase 6.
+- **Silver** — the cleaned single source of truth: one row per company, metric and period,
+  holding the latest filed value; schema differences resolved; standard metric names; Q4
+  derived; a company dimension that keeps name history (SCD Type 2 — e.g. Facebook to Meta).
+  Written by Spark.
+- **Gold** — business-ready tables: a star schema (`fct_financials` plus company, metric and
+  period dimensions) and wide tables for the agent with margins and year-on-year growth.
+  Written by Spark, exported to BigQuery.
+
+### D4 — Bronze is plain Parquet; silver and gold are Delta Lake
+
+Bronze is immutable raw data — append a new quarter, or replace a republished one — so plain
+Parquet is enough. Silver and gold need what Delta Lake's transaction log adds:
+- **MERGE**, to update old periods when a company restates them;
+- **all-or-nothing writes**, so a failed run never corrupts gold;
+- **time travel**, to query a table as of an earlier version ("what did we believe before this
+  restatement?");
+- **schema enforcement and evolution**.
+
+Costs: a little Spark configuration; housekeeping (`OPTIMIZE` merges small files, `VACUUM`
+deletes old versions — also needed to stay under GCS's 5 GB); and BigQuery loads a plain
+Parquet export of gold rather than reading Delta directly.
+
+Alternatives: **Apache Iceberg** — its GCP advantage is BigQuery's native Iceberg support;
+Delta's advantage is its tight integration with Spark, whose Delta implementation is the
+reference one. **Apache Hudi** — less common.
+
+### D5 — Ingestion is Python + pyarrow, not Spark
+
+Ingestion is network work: check a page, download one 60–120 MB ZIP, verify it, unzip it, and
+convert under 1 GB of text. Spark can't download files, has nothing to parallelise in a single
+file, and would add 10–20 seconds of Java start-up and a ~400 MB image to a weekly check that
+usually finds nothing new.
+
+Alternative rejected: land raw files only and have Spark convert them to bronze at the start of
+Phase 7. It would make Phase 6 depend on Spark setup and add about half a weekend to Phase 7,
+already the phase most likely to overrun.
+
+### D6 — BigQuery holds gold only
+
+Gold is estimated at a few hundred MB, comfortably inside the free 10 GiB. The agents query it
+in Phase 8 as planned, through the `DataSource` abstraction (locked decision #4). Spark never
+sits in the request path — starting Java inside the web app would ruin response times.
+
+### D7 — Production orchestration: Cloud Scheduler, Cloud Workflows, Cloud Run Jobs
+
+Cloud Scheduler fires weekly; Cloud Workflows runs ingest, transform and load in order. Weekly
+rather than quarterly because the SEC doesn't publish on a fixed date and sometimes republishes
+old quarters: checking weekly and doing nothing when nothing has changed is more robust than
+guessing the date (Airflow calls this a "sensor"). Airflow runs the same pipeline locally in
+Docker as the portfolio artifact. Cloud Composer is avoided — no free tier (locked decision #2).
+
+### D8 — The Spark image lives on GitHub Container Registry
+
+A Spark image (Java + PySpark) is estimated at ~400 MB, which would push Artifact Registry past
+its 0.5 GB free tier alongside the existing 211 MB app image. Cloud Run jobs can pull public
+GHCR or Docker Hub images directly
+([Cloud Run docs](https://docs.cloud.google.com/run/docs/create-jobs)). Google caches those
+images for up to an hour and recommends Artifact Registry for higher availability — an
+acceptable trade-off for a weekly batch job. The image holds no secrets.
+
+### D9 — PySpark only
+
+All Spark code uses the Python API, occasionally `spark.sql(...)`. No Scala: PySpark keeps the
+whole project in one language — ingestion, the app, the agents and the tests — and it's the
+most widely used Spark API.
+
+### D10 — Every component stays inside a free tier
+
+Verified against [GCP's free-tier page](https://docs.cloud.google.com/free/docs/free-cloud-features)
+on 2026-10-03.
+
+| Component | Free basis | Limit to respect |
+|---|---|---|
+| SEC data | Free public data | Declared User-Agent with contact email; at most 10 requests/second |
+| Python, pyarrow, PySpark, Delta Lake, Great Expectations, Airflow | Open source | — |
+| GitHub Actions | Free and unlimited on public repos (4 vCPU, 16 GB runners) | Repo stays public |
+| GitHub Container Registry | Free for public images | Spark image public, no secrets in it |
+| Cloud Storage | 5 GB-months | `us-central1`, `us-east1` or `us-west1` only; `VACUUM` old Delta files |
+| BigQuery | 10 GiB storage, 1 TiB queries/month, batch loads free | Gold only; `maximum_bytes_billed` on every query |
+| Cloud Run (app + jobs) | Free compute allowance | Jobs' allowance confirmed in Phase 9 |
+| Cloud Scheduler | 3 free jobs per billing account | 1 needed |
+| Cloud Workflows | 5,000 internal steps/month | About 10 per run |
+| Artifact Registry | 0.5 GB | Small images only |
+| Secret Manager, Cloud Logging | Free tier | Trivial at this usage |
+| Groq | Free tier | Rate-limited, never billed |
+| Docker Desktop, WSL2 | Free for personal use | Personal laptop |
+
+**Deliberately avoided** (no free tier): managed Spark (Dataproc), Dataflow, Cloud Composer,
+Snowflake (trial only). **Guards:** the $1 budget alert, BigQuery byte caps, Delta `VACUUM`, and
+the Artifact Registry cleanup policy. Google can change free tiers with 30 days' notice — the
+budget alert is what catches that.
+
+### D11 — Batch processing, not streaming
+
+The source is batch by nature: companies file financial statements quarterly and annually, and
+the SEC publishes these data sets once a quarter. The questions the platform answers — revenue
+growth, margins, multi-year trends — need data that is days old at most, not seconds. Streaming
+would add always-on infrastructure and operational complexity with no gain in answer quality.
+
+The problems streaming is known for still appear here in batch form: late-arriving data
+(amended filings, restatements, republished quarters) and exactly-once results (manifest checks
+in ingestion, MERGE in Delta Lake).
+
+**If sub-day freshness were ever needed:** EDGAR publishes filings throughout each business day
+and indexes them nightly, so individual filings could be ingested daily or near real time —
+Pub/Sub → Spark Structured Streaming or Dataflow → BigQuery. Locally that's free (Kafka or
+Structured Streaming in Docker); deployed, it needs always-on compute, which has no free tier
+(Dataflow) — another reason not to build it without a real freshness requirement.
+
+## 4. The source in detail
+
+- **What it is:** the numeric data from the face financial statements of every XBRL filing
+  submitted to the SEC
+  ([SEC page](https://www.sec.gov/data-research/sec-markets-data/financial-statement-data-sets)).
+- **Coverage:** 2009 Q1 – 2026 Q2 at the time of writing — 70 quarterly ZIPs, about 5.4 GB in
+  total. Most quarters since 2012 are 60–120 MB.
+- **Files in each ZIP** (confirmed 2026-10-08 against a real downloaded ZIP — lowercase,
+  `.txt`, tab-separated): `sub.txt` (one row per filing: company ID/CIK, name, industry code,
+  form type, fiscal year and period, filing date), `num.txt` (one row per reported figure:
+  concept name, period end date, duration in quarters, unit, value, `segments`), `tag.txt`
+  (concept definitions) and `pre.txt` (where each figure appears in the statements, with the
+  company's own label). Each ZIP also contains a `readme.htm` — SEC-authored documentation, not
+  data; explicitly excluded from bronze in Step 5.
+- **Cadence:** quarterly. Filings submitted after a quarter's last business day go into the next
+  posting.
+- **December 2024 republication:** the whole history was reposted, limited to the primary
+  financial statements, and `NUM` gained a `segments` column. Old quarters can change, so
+  ingestion must detect changed files, not just new ones.
+- **Access rules** ([SEC fair access](https://www.sec.gov/os/accessing-edgar-data)): declare a
+  User-Agent with a name and contact email; at most 10 requests per second; no crawling.
+- **What it can't answer:** stock prices or valuation, private companies, detailed product-level
+  revenue.
+- **Exact column definitions:** confirmed 2026-10-08 directly against a real downloaded ZIP's
+  header rows (not just the SEC's documentation) — see the four schemas in Step 5. A snapshot of
+  the SEC's own field-definitions document is kept verbatim (not converted to Markdown, to avoid
+  losing table formatting) at
+  [`docs/sec_fsds_readme_2026q2.htm`](sec_fsds_readme_2026q2.htm), copied in manually rather than
+  by ingestion code (which deliberately treats `readme.htm` as documentation, not data — see
+  item 4 of section 4 below). Not kept in automated sync with future SEC updates; re-copy
+  manually if the SEC changes the schema again.
+
+## 5. Phase 6 ingestion design (locked 2026-10-06)
+
+1. **Bronze layout:** `data/lake/bronze/sec_fsds/<table>/quarter=2026q2/part-0.parquet`. The
+   `quarter=` folder style lets Spark read `quarter` as a column and skip partitions it doesn't
+   need. Implemented as `ingestion/storage.py`'s path-building functions.
+2. **Manifest:** one JSON file per quarter, `data/lake/bronze/sec_fsds/_manifests/2026q2.json`,
+   holding the source URL, ZIP sha256 and size, `etag`/`last_modified` (as returned by the SEC's
+   server, for item 3's cheap pre-check), row count per table, schema version and load time. One
+   file per quarter keeps every update self-contained. Read/write lives in `ingestion/storage.py`
+   (Step 5); writes are atomic (`.tmp`, then `os.replace`).
+3. **Change detection (two layers, added 2026-10-08 during Step 4 review):**
+   - **Cheap pre-check:** `HEAD` the quarter's URL and compare `ETag`/`Last-Modified` against
+     the manifest, without downloading the body. Implemented as `get_remote_metadata()` +
+     `needs_download()` in `ingestion/sources/sec_fsds.py`. Defaults to "needs download"
+     whenever either side is missing the headers to compare, or the `HEAD` request itself fails
+     — this can only cause an unnecessary download, never a missed change, since it's never the
+     final authority.
+   - **Authoritative check:** download, compute sha256, compare with the manifest — catches a
+     real content change even if the SEC's `ETag`/`Last-Modified` headers are absent, wrong, or
+     a re-packaged ZIP changes without the content inside actually changing (accepted trade-off:
+     this can only cause an unnecessary *re-run*, never a missed change — see risk note below).
+   **URL pattern** (confirmed 2026-10-07): `https://www.sec.gov/files/dera/data/financial-statement-data-sets/<quarter>.zip`,
+   e.g. `.../2026q2.zip` — the owner confirmed this against the real SEC page, and Step 6
+   downloaded 2009q1, 2009q2, 2009q3, 2015q1, 2026q2 and 2026q3 with it.
+3a. **Retry on transient failures (added 2026-10-08, tuned same day after review):**
+    `download_quarter()` retries on `ConnectionError`/`Timeout` and on 5xx responses — never on
+    4xx (e.g. a 404 means the URL/quarter is wrong; retrying can't fix that). Attempt count and
+    backoff are configurable via `ingestion/config.py`
+    (`get_max_download_attempts()`/`get_retry_backoff_seconds()`, env-overridable) rather than
+    hardcoded in `sec_fsds.py` — this is operational policy, not a fact about the SEC's API,
+    the same distinction `BASE_URL`/the quarter regex make in the other direction. Defaults:
+    4 attempts, backoff `2s → 8s → 20s` — widened from an initial `(1, 2)` once review flagged
+    that a real transient server issue typically needs 10-30s to recover, and a weekly,
+    unattended job (Phase 9) loses nothing by being patient rather than fast.
+4. **Schemas (implemented 2026-10-08 in `ingestion/sources/sec_fsds_schema.py`):** an explicit
+   pyarrow schema per table, never type inference, transcribed from the SEC's own field
+   definitions (`docs/sec_fsds_readme_2026q2.htm`, Figures 2-5). Each field also records the
+   SEC's format, max size, "May be NULL" and key, so Phase 7's MERGE keys and Phase 10's checks
+   read from the same place. Decisions made against the spec:
+   - **Followed the spec:** `value` as `decimal128(28, 4)` (the spec's `NUMERIC(28,4)`, exact
+     rather than float); the SEC's `BOOLEAN (1/0)` flags as `bool`; `DATE (yyyymmdd)` fields as
+     `date32`; `accepted` as `timestamp(ms)`; `fye` kept a string (`ALPHANUMERIC (mmdd)` —
+     `"0630"` would become `630` as an integer); `changed` kept a string because the spec lists
+     it as `ALPHANUMERIC`, unlike `period`/`filed`.
+   - **Deliberately deviated:** `cik`, `sic`, `ein` are `NUMERIC` in the spec but stored as
+     strings — they're identifiers/codes, and a leading zero in the source text (SIC codes
+     0100-0999 exist; EINs can start with 0) would be silently dropped by integer parsing. To
+     revisit after Step 6 inspects real values; switching later is a `SCHEMA_VERSION` bump,
+     or a cast in silver.
+   - **Nullability recorded, not enforced:** every bronze field is nullable, so data lands
+     exactly as published; enforcing the SEC's "May be NULL: No" belongs to Phase 10.
+   - **`SCHEMA_VERSION`:** recorded in every manifest; bumping it makes the bronze writer
+     rebuild each quarter from its landing ZIP, with no re-download.
+   **Reader settings** (in `ingestion/sources/sec_fsds_bronze.py`): tab-delimited and
+   **CSV-style quoted** — the readme describes plain TSV, but a real 2026q2 `num.txt` wraps any
+   value containing a quote, tab or newline in double quotes, with inner quotes doubled (`""`).
+   Found when the first real run failed with "Expected 10 columns, got 11" (a tab inside a
+   quoted `segments` value). With quoting off, quoted values without a tab would have loaded
+   silently with their wrapper quotes - which no row count catches - so quoting is on
+   (`quote_char='"'`, `double_quote`, `newlines_in_values`); **only an empty field is
+   NULL** — pyarrow's defaults would also null out `"NA"`, which is Namibia's ISO country code;
+   whitespace trimmed before converting non-text fields only (text is kept byte-for-byte);
+   streamed in batches so memory stays bounded however large `num.txt` is; Parquet compressed
+   with zstd. A header that doesn't match the schema (new, missing or duplicated columns) fails
+   loudly, except `segments`, which is filled with nulls if absent.
+5. **Atomic writes (implemented 2026-10-08):** all four tables are written into
+   `_staging/<quarter>/` and row-checked first, then moved into their partitions
+   (`os.replace`, atomic per file), and the manifest is written **last** as the commit marker.
+   Any failure before that leaves the previous manifest in place, so the next run sees the
+   quarter as changed and rebuilds it — a failed rebuild never corrupts the last good build.
+   Row counts are checked against an independent, quote-aware count of each source file's
+   records, made with Python's `csv` module rather than pyarrow - a second parser, so a shared
+   parsing mistake can't fool both.
+   A re-run is a no-op when the manifest's sha256 and `SCHEMA_VERSION` match and all four
+   files exist; `force=True` rebuilds anyway.
+6. **HTTP client:** `requests` over `httpx` — simple, and already a real dependency elsewhere in
+   the repo (`src/groq_all_models.py`).
+7. **SEC contact header:** a required `SEC_USER_AGENT` environment variable, read by
+   `ingestion/config.py`; missing means fail fast. Not added to the app's `src/config.py`, since
+   ingestion is a separate deployable with its own environment. **`.env` loading (added
+   2026-10-08, caught by the owner):** `ingestion/config.py` calls `load_dotenv()` at import
+   time, mirroring `src/services/llm_service.py`'s exact pattern — without this, `.env` entries
+   were silently invisible to `python -m ingestion`, since the app's `load_dotenv()` call never
+   runs on the ingestion import path. `python-dotenv` added to `requirements-ingestion.txt`
+   (not just transitively available via `requirements.txt`) to keep it self-contained for
+   Phase 9's standalone ingestion container.
+8. **Storage location:** local only in Phase 6, via `ingestion/config.py`'s configurable
+   `INGESTION_LAKE_ROOT` (default `data/lake`). **Correction (2026-10-13, from the Step 6
+   review):** this item originally said Phase 9 could point that setting at `gs://` "without a
+   code change". That was wrong. `storage.py`, the bronze writer and the downloader use
+   local-only calls (`open`, `os.replace`, `shutil.rmtree`, `os.makedirs`); pyarrow can write to
+   GCS, but the rest of the code doesn't go through it. Phase 9 needs a write-locally-then-upload
+   step (or a filesystem abstraction); uploading the manifest last keeps it the commit marker,
+   because a GCS object write is atomic. Tracked as risk #28 in `PHASES.md`.
+9. **Raw ZIP retention:** keep the latest ZIP per quarter under `data/lake/landing/sec_fsds/`
+   (gitignored), so bronze can be rebuilt without re-downloading. Not copied to GCS.
+10. **Choosing quarters:** `--quarter 2026q2`, `--from 2024q1 --to 2026q2`, and `--check` to list
+    new or changed quarters without downloading. Argument parsing scaffolded in `ingestion/cli.py`
+    in Step 3; real dispatch lands in Step 6.
+11. **Dependencies:** `requirements-ingestion.txt` (pyarrow, requests), self-contained so Phase
+    9's ingestion container can install it directly. Pulled into `requirements-dev.txt` via `-r`
+    so CI tests ingestion code too; `requirements.txt` and the app image stay untouched.
+12. **Tests (decided 2026-10-06, during Step 2):** `tests/unit/ingestion/` — a subfolder inside
+    the existing `tests/` root, not a separate top-level test tree, so `pytest.ini`'s
+    `testpaths = tests` and the existing `conftest.py` chain keep working unchanged. Fixtures
+    are synthetic (fake companies, never real SEC data). **Changed in Step 5:** rather than a
+    binary ZIP checked into `tests/data/ingestion/`, the bronze tests build a tiny ZIP at test
+    time from Python-defined rows — the tab-separated content is then exact and readable in
+    code review, there's no binary blob in git, and each test can vary just the row it needs.
+    All HTTP calls mocked with `pytest-mock`; never the network. **Naming constraint (caught 2026-10-08):**
+    since nowhere in `tests/` has an `__init__.py`, pytest imports every test file as a bare
+    top-level module named after its filename alone — a `tests/unit/ingestion/test_config.py`
+    collided with the existing `tests/unit/test_config.py` (`src/config.py`'s tests), since both
+    resolved to the same module name. Fixed by renaming to `test_ingestion_config.py` rather
+    than adding `__init__.py` files repo-wide (which risked a worse collision: making
+    `tests.unit.ingestion` resolve confusingly close to the real top-level `ingestion` package
+    already on `sys.path`). **Every new file under `tests/unit/ingestion/` needs a basename
+    that's unique across the whole `tests/` tree** — check before naming, don't assume the
+    subfolder provides isolation on its own.
+13. **CI coverage (decided 2026-10-06):** `ci.yml`'s pytest line gained `--cov=ingestion`
+    alongside `--cov=src`, blended into the same 70% gate — without this, `ingestion/` code could
+    ship with zero test coverage and CI would still pass, since `--cov=src` alone never looks at
+    it.
+
+**Measurements (Step 6, first real run, 2026q2, 2026-10-12):**
+
+| | Measured |
+|---|---|
+| Rows | sub 7,714 · num 3,608,711 · tag 92,731 · pre 785,490 |
+| ZIP | 57.6 MB (60,419,016 bytes) |
+| Unzipped text | 685 MB (about 12x the ZIP) |
+| Bronze Parquet (zstd) | ~48 MB: num 33.7, pre 9.4, tag 4.4, sub 0.7 - about 0.84x the ZIP, ~14x smaller than the unzipped text |
+| Full rebuild | 52.7 s including the download; a re-run with unchanged headers downloads nothing |
+
+**Extrapolated to all 70 quarters** (the SEC's listed ZIPs total ~5.4 GB; ratios from one quarter,
+so rough): unzipped text ≈ 45–65 GB (at 8–12x), bronze Parquet ≈ 4.5 GB, a full backfill about an
+hour at worst (older quarters are smaller). For the free tiers: full-history bronze alone would
+nearly fill GCS's 5 GB, so full history stays on local disk and the GCS lake holds a recent window
+(8 quarters ≈ 0.4–0.8 GB); BigQuery still gets only the compact gold layer.
+
+**Other quarters ingested with the same command** (checking the extrapolation):
+
+| Quarter | num rows | ZIP |
+|---|---|---|
+| 2009q1 | 0 | 13 KB |
+| 2009q2 | 3,999 | 0.1 MB |
+| 2009q3 | 126,650 | 3.4 MB |
+| 2015q1 | 3,322,479 | 94.4 MB |
+| 2026q2 | 3,608,711 | 57.6 MB |
+| 2026q3 | 3,905,397 | 62.1 MB |
+
+The three quarters sampled from 2015 on all sit between 3.3M and 3.9M figures, which suggests a
+steady volume (not checked in between), with the first few quarters tiny - so the full history is
+on the order of 200M figures (rough). 2009q1 has no figures at all and ingests as an empty table
+without error. The ~12x unzipped ratio was measured on 2026q2 only; 2015q1's ZIP is larger than
+2026q2's for a similar row count, so older quarters may compress differently.
+
+**Findings from the first real run** (what the readme and the synthetic tests didn't tell us):
+- **The files are CSV-style quoted** - see item 4's reader settings.
+- **The SEC sends `Last-Modified` but no `ETag`.** The cheap header check works through
+  `last_modified`; `etag` is stored as null. Confirmed: a re-run printed "SEC headers match the
+  manifest; nothing downloaded".
+- **Foreign filers are in the data:** 20-F (521) and 6-K (104) filings sit beside 10-Q (5,321),
+  11-K (731) and 10-K (570). About 8% of filings record a non-US business address (CA, CN, HK, SG,
+  GB, IE, KY, IL lead).
+- **The country columns are unreliable for foreign filers.** `countryba` is NULL for 268 of 521
+  20-F filings and 582 of 7,714 filings overall. Infosys and Wipro are in the data (20-F) with
+  both `countryba` and `countryinc` NULL; Dr. Reddy's has `countryinc = IN` but `countryba` NULL.
+  A filter on `countryba = 'IN'` finds nothing even though Indian companies are present - country
+  enrichment belongs in Phase 7's silver layer.
+- **Foreign filers probably use IFRS tags, not us-gaap** (they report under IFRS) - unverified;
+  if so, Phase 7's concept map must cover both taxonomies.
+- **The SEC's text appears to drop some non-ASCII characters:** 18 rows (14 distinct footnotes)
+  contain doubled quotes; the samples seen read `Euro ("")` and `British Pound ("")`, where a
+  currency symbol (€, £) evidently was, while `$`, `A$` and `C$` survive. A source-data quirk,
+  not ours (inferred from three samples) - relevant to Phase 10.
+
+## 6. Interview talking points
+
+- **"Why this dataset?"** — "I wanted the problems analytics teams actually face. SEC data as
+  published isn't usable for analysis: companies re-report and restate past figures, use
+  different names for the same metric, have fiscal years ending in different months, and never
+  file a Q4 report. My pipeline turns as-filed data into comparable metrics — essentially what
+  commercial financial data vendors do."
+- **"Why Spark? Why not dbt?"** — "The full history is larger than the memory of any machine
+  this project runs on, and resolving restatements needs all of it at once, so I needed an
+  engine that processes data larger than memory. I chose PySpark because the same code scales
+  from one machine to a cluster, it has the most mature Delta Lake support for the MERGE-based
+  restatement logic, and its transformations are easy to unit-test. Only the compact gold layer
+  lands in BigQuery. dbt runs SQL inside a warehouse — if all the data lived there, I'd likely
+  build gold in dbt or Dataform. At today's size DuckDB would probably be faster on one machine;
+  I accepted that for the scale-out path and Delta Lake's features."
+- **"Why Delta Lake?"** — MERGE for restatements, all-or-nothing writes, time travel, schema
+  enforcement.
+- **"Why is ingestion plain Python?"** — it's network work; Spark can't download and has nothing
+  to parallelise in one file.
+- **"Why weekly?"** — the SEC has no fixed publishing date and republishes history; a weekly
+  check that usually does nothing is the robust option.
+- **"Why batch, not streaming?"** — "The data and the questions are batch-shaped: companies file
+  quarterly, the SEC publishes quarterly, and nobody needs revenue growth to the second. I
+  matched the processing model to how the data arrives and how fresh answers need to be. The
+  streaming-style problems still exist here — late amendments, republished history,
+  exactly-once results — and the pipeline handles them with manifests and Delta MERGE. For
+  sub-day freshness, I'd ingest individual filings from EDGAR's daily feeds through Pub/Sub into
+  Spark Structured Streaming or Dataflow."
+- **Pushback: "The SEC already publishes this."** — published data has all the problems above;
+  fixing them is the engineering.
+- **Pushback: "Why not the SEC's own API?"** — it returns one concept per call, doesn't reconcile
+  concept names, and the bulk files allow replaying full history.
+
+## 7. Risks
+
+- **Phase 7 overrun** — learning Spark and the SEC format at the same time. The plan's slack
+  covers about one extra weekend.
+- **The size estimate (checked in Step 6, extrapolated from one quarter):** the original 30–40 GB
+  guess was low; one measured quarter (685 MB unzipped) implies roughly 45–65 GB - still far
+  beyond a laptop's memory, so D2's reasoning holds. Older quarters (2009q1-q3, 2015q1) ingested
+  and their row counts fit the picture, but the unzipped ratio is still from 2026q2 alone.
+- **The SEC changes its format again** — the bronze schema contract fails loudly, and Great
+  Expectations checks bronze from Phase 10.
+- **Spark image on GHCR** — Cloud Run caches public images for up to an hour; fine for a weekly
+  batch job.
+- **Free-tier changes** — 30 days' notice; the budget alert catches them.
+- **GCP PDE exam (Dec/Jan)** — competes for the same ~10 hours a week; the timeline will be
+  aligned once the exam plan is shared.
+
+## 8. Regenerating the diagram
+
+Edit `diagrams/platform_architecture.mmd`, then either:
+
+- **mermaid.live:** paste the file's contents at https://mermaid.live, then **Actions →
+  PNG**, and save it as `docs/diagrams/platform_architecture.png`; or
+- **PowerShell, from the repo root** (uses the free mermaid.ink renderer):
+
+```powershell
+$src = Get-Content -Raw docs\diagrams\platform_architecture.mmd
+$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($src)).Replace('+','-').Replace('/','_')
+Invoke-WebRequest -Uri "https://mermaid.ink/img/${b64}?type=png&bgColor=!white&width=1600&scale=2" -OutFile docs\diagrams\platform_architecture.png
+```

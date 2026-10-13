@@ -2,15 +2,21 @@
 
 [![CI](https://github.com/reginald-francis/ai-autonomous-data-analyst/actions/workflows/ci.yml/badge.svg)](https://github.com/reginald-francis/ai-autonomous-data-analyst/actions/workflows/ci.yml)
 
-A data platform with an AI agent as its serving layer. A public dataset is ingested on a
-schedule, landed in raw storage, modeled through dbt into a warehouse, and checked for data
-quality — and the multi-agent system in this repo answers natural-language questions against
-it, alongside its original CSV-upload mode. The agent side is hand-rolled — a planner,
-complexity-based routing, and a retry loop — rather than built on a framework, with built-in
-SQL querying, chart generation, and structured responses.
+A data platform with an AI agent as its serving layer. SEC EDGAR financial statement data is
+checked for updates on a schedule, landed as Parquet, transformed with PySpark and Delta Lake,
+served from a BigQuery warehouse, and checked for data quality — and the multi-agent system in
+this repo answers natural-language questions against it, alongside its original CSV-upload mode.
+The agent side is hand-rolled — a planner, complexity-based routing, and a retry loop — rather
+than built on a framework, with built-in SQL querying, chart generation, and structured responses.
+
+**Status:** the serving layer is live, and ingestion (SEC EDGAR into typed bronze Parquet) is
+built. Spark + Delta Lake, BigQuery serving, orchestration and data quality come next — see
+[Project Phases](#project-phases).
 
 ## What it does
 - Accepts CSV file input, or (once the platform lands) queries a warehouse directly
+- Ingests the SEC's Financial Statement Data Sets quarter by quarter into typed, partitioned bronze
+  Parquet — idempotent, with change detection, atomic writes and a manifest per quarter
 - Generates a dataset-agnostic context (row/column counts, dtypes, categorical values, numeric
   ranges) from whatever file is actually uploaded — works on any CSV, not just the sample data
 - Accepts an optional business-context document alongside the CSV (a column glossary,
@@ -41,19 +47,20 @@ extra seconds (cold start).
   hardcoded prompt rules (see `PHASES.md` Phase 4)
 - Matplotlib, Tabulate
 - pydantic-settings — centralized config (Phase 2)
-- pytest — 200+ automated tests as of Phase 5 (see `PHASES.md`)
+- pytest — unit and integration suites, with a 70% coverage gate in CI over `src/` and `ingestion/`
 - ruff (lint) + GitHub Actions CI — matrix Python 3.11/3.13 (Phase 3)
 - Docker + Google Cloud Run — deployed, Phase 5 (see Live Demo above)
+- pyarrow + requests — SEC ingestion into Parquet (`ingestion/`, Phase 6)
 
-Planned as the platform builds out: dbt, BigQuery, Airflow, Great Expectations,
-LangGraph, Streamlit. See [`PHASES.md`](PHASES.md) for the full plan.
+Planned as the platform builds out: PySpark + Delta Lake, BigQuery, Airflow, Cloud Workflows,
+Great Expectations, LangGraph, Streamlit. See [`PHASES.md`](PHASES.md) for the full plan.
 
 ## Project Phases
 
 The multi-agent serving layer (V1 through V5) is complete — see
-[`PROJECT_PLAN.md`](PROJECT_PLAN.md) for that history. The data platform build is now
-in progress; see [`PHASES.md`](PHASES.md) for the current phase, the full 13-phase plan, and
-locked architectural decisions.
+[`PROJECT_PLAN.md`](PROJECT_PLAN.md) for that history. Of the data platform's 13 phases,
+Phases 1-6 are done (through SEC ingestion into bronze Parquet) and Phase 7, Spark + Delta Lake,
+is next; see [`PHASES.md`](PHASES.md) for the full plan and locked architectural decisions.
 
 ## Setup
 
@@ -61,7 +68,9 @@ locked architectural decisions.
 
 2. Create a virtual environment and activate it
 ```
-source venv/Scripts/activate
+python -m venv venv
+.\venv\Scripts\Activate.ps1      # Windows PowerShell
+source venv/bin/activate         # macOS / Linux
 ```
 
 3. Install dependencies (this pulls in `requirements.txt` too, plus pytest/ruff for
@@ -83,10 +92,30 @@ uvicorn src.main:app --reload
 ## Tests
 
 ```bash
-pytest                    # unit tests only (default) — no real API calls
-pytest -m live_api        # the handful of tests that hit Groq for real
-pytest --cov=src --cov-report=term-missing
+ruff check .              # lint — CI runs this first
+pytest                    # default: no real API calls
+pytest --cov=src --cov=ingestion --cov-report=term-missing --cov-fail-under=70   # what CI runs
+pytest -m live_api        # the few tests that hit Groq for real
 ```
+
+## Ingestion
+
+Lands the SEC's quarterly Financial Statement Data Sets as typed Parquet under `data/lake/`.
+The SEC asks automated clients to identify themselves, so add a contact to `.env` first:
+
+```
+SEC_USER_AGENT=Your Name your.email@example.com
+```
+
+```bash
+python -m ingestion --source sec_fsds --quarter 2026q2                    # one quarter
+python -m ingestion --source sec_fsds --from 2024q1 --to 2026q2           # a range
+python -m ingestion --source sec_fsds --from 2024q1 --to 2026q2 --check   # what would run; downloads nothing
+```
+
+Re-running is safe: a quarter the SEC hasn't changed is skipped without downloading, and a failed
+quarter is reported (exit code 1) without stopping the rest of a range. Design, schemas and
+measurements from a real quarter: [`docs/PHASE6_DESIGN.md`](docs/PHASE6_DESIGN.md).
 
 ## API Endpoints
 
@@ -161,6 +190,38 @@ curl -X POST http://localhost:8000/ask \
 ```
 
 ## Architecture (High Level)
+
+The platform has two halves: a data pipeline that turns the SEC's filings into a queryable
+warehouse, and the agent system that answers questions against it. Ingestion and the serving
+layer are built; the rest is planned (see [`PHASES.md`](PHASES.md)).
+
+```mermaid
+flowchart LR
+    subgraph built [Built]
+        SEC["SEC EDGAR: quarterly ZIPs"] --> Ingest["Ingestion CLI: Python + pyarrow"]
+        Ingest --> Bronze["Bronze: typed Parquet + manifest"]
+        Upload["CSV upload"] --> API
+        API["FastAPI + agents on Cloud Run"] --> Groq["Groq LLM"]
+    end
+    subgraph planned [Planned: Phases 7-10]
+        Spark["PySpark + Delta Lake"] --> Silver["Silver: clean, deduplicated"]
+        Silver --> Gold["Gold: star schema + agent tables"]
+        Gold --> BQ["BigQuery: gold only"]
+        Orch["Cloud Scheduler + Workflows, Airflow locally"]
+        DQ["Great Expectations checks"]
+    end
+    Bronze --> Spark
+    BQ --> API
+    Orch -.-> Ingest
+    Orch -.-> Spark
+    DQ -.-> Silver
+```
+
+The full target architecture, with the reasoning behind each choice, is in
+[`docs/PHASE6_DESIGN.md`](docs/PHASE6_DESIGN.md) (diagram:
+[`docs/diagrams/platform_architecture.png`](docs/diagrams/platform_architecture.png)).
+
+### Serving layer: how a question is answered
 ```
 POST /upload (multipart: file + question)
   │

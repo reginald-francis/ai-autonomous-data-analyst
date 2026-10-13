@@ -38,7 +38,7 @@ jobs:
         # Phases 1-3's lazy-client/DI work was making the default suite run
         # without a real key. live_api-marked tests are excluded by
         # pytest.ini's addopts, so this never attempts a real Groq call.
-        run: pytest -m "not live_api" --cov=src --cov-report=term-missing --cov-fail-under=70
+        run: pytest -m "not live_api" --cov=src --cov=ingestion --cov-report=term-missing --cov-fail-under=70
 
   # Builds the deploy image on every push and reports its size against
   # Artifact Registry's 0.5GB free-tier limit (Phase 5) — catches a build

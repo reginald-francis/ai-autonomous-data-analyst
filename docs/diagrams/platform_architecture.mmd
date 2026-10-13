@@ -1,0 +1,49 @@
+flowchart TB
+    subgraph srcLayer [Source]
+        SEC["SEC EDGAR: quarterly ZIPs"]
+    end
+    subgraph orch [Production orchestration]
+        Scheduler["Cloud Scheduler: weekly trigger"]
+        Workflow["Cloud Workflows: runs steps in order"]
+    end
+    subgraph jobs [Batch jobs on Cloud Run Jobs]
+        IngestJob["Ingestion job: Python + pyarrow"]
+        SparkJob["Spark job: PySpark + Delta Lake + Great Expectations"]
+    end
+    subgraph lakeLayer [Lake in a GCS bucket]
+        Bronze["Bronze: raw Parquet per quarter + manifest"]
+        Silver["Silver: Delta, clean deduplicated facts"]
+        Gold["Gold: Delta, star schema + agent tables"]
+    end
+    subgraph whLayer [Warehouse]
+        BQ["BigQuery: gold only, partitioned + clustered"]
+    end
+    subgraph serveLayer [Serving on a Cloud Run service]
+        API["FastAPI + agents: CSV uploads and warehouse questions"]
+        UI["Streamlit demo, Phase 12"]
+    end
+    subgraph devLayer [Development and CI]
+        Laptop["Personal laptop: WSL2, Docker, Airflow DAG, full-history backfill"]
+        CI["GitHub Actions: lint, tests incl. PySpark, image builds"]
+        Images["Images: Artifact Registry for small images, GHCR for Spark"]
+    end
+    Scheduler --> Workflow
+    Workflow -->|"1. check and ingest"| IngestJob
+    Workflow -->|"2. transform"| SparkJob
+    Workflow -->|"3. load"| BQ
+    SEC --> IngestJob
+    IngestJob --> Bronze
+    Bronze --> SparkJob
+    SparkJob --> Silver
+    Silver -->|"Spark"| Gold
+    Gold -->|"Parquet export, free batch load"| BQ
+    BQ --> API
+    API --> UI
+    API --> Groq["Groq LLM API"]
+    Secrets["Secret Manager: Groq key"] -.-> API
+    Users["End Users"] --> UI
+    Users --> API
+    Laptop -.->|"git push"| CI
+    CI --> Images
+    Images -.-> IngestJob
+    Images -.-> SparkJob

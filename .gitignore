@@ -25,3 +25,7 @@ data/charts/*
 # Uploaded files — generated from user file uploads
 data/uploads/*
 !data/uploads/.gitkeep
+
+# SEC EDGAR lake (Phase 6) — generated locally by `python -m ingestion`;
+# rebuildable from the SEC's published files, never checked in
+data/lake/
