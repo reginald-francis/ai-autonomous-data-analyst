@@ -40,8 +40,8 @@ def get_sec_user_agent() -> str:
 def get_lake_root() -> str:
     """Return the root path of the data lake.
 
-    Local disk by default; Phase 9 points this at a gs:// bucket via the
-    same environment variable, since pyarrow has a built-in GCS filesystem.
+    Local disk only for now. Phase 9 needs a write-locally-then-upload step
+    before this can point at a gs:// bucket - see PHASES.md risk #28.
     """
     return os.environ.get("INGESTION_LAKE_ROOT", "data/lake")
 

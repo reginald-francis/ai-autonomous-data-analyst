@@ -306,8 +306,8 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
      a re-packaged ZIP changes without the content inside actually changing (accepted trade-off:
      this can only cause an unnecessary *re-run*, never a missed change — see risk note below).
    **URL pattern** (confirmed 2026-10-07): `https://www.sec.gov/files/dera/data/financial-statement-data-sets/<quarter>.zip`,
-   e.g. `.../2026q2.zip` — the owner confirmed this against the real SEC page; assumed consistent
-   back to 2009q1, to be verified against a real older quarter in Step 6.
+   e.g. `.../2026q2.zip` — the owner confirmed this against the real SEC page, and Step 6
+   downloaded 2009q1, 2009q2, 2009q3, 2015q1, 2026q2 and 2026q3 with it.
 3a. **Retry on transient failures (added 2026-10-08, tuned same day after review):**
     `download_quarter()` retries on `ConnectionError`/`Timeout` and on 5xx responses — never on
     4xx (e.g. a 404 means the URL/quarter is wrong; retrying can't fix that). Attempt count and
@@ -371,8 +371,13 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
    (not just transitively available via `requirements.txt`) to keep it self-contained for
    Phase 9's standalone ingestion container.
 8. **Storage location:** local only in Phase 6, via `ingestion/config.py`'s configurable
-   `INGESTION_LAKE_ROOT` (default `data/lake`), so Phase 9 can point it at `gs://` without a
-   code change (pyarrow has a built-in GCS filesystem).
+   `INGESTION_LAKE_ROOT` (default `data/lake`). **Correction (2026-10-13, from the Step 6
+   review):** this item originally said Phase 9 could point that setting at `gs://` "without a
+   code change". That was wrong. `storage.py`, the bronze writer and the downloader use
+   local-only calls (`open`, `os.replace`, `shutil.rmtree`, `os.makedirs`); pyarrow can write to
+   GCS, but the rest of the code doesn't go through it. Phase 9 needs a write-locally-then-upload
+   step (or a filesystem abstraction); uploading the manifest last keeps it the commit marker,
+   because a GCS object write is atomic. Tracked as risk #28 in `PHASES.md`.
 9. **Raw ZIP retention:** keep the latest ZIP per quarter under `data/lake/landing/sec_fsds/`
    (gitignored), so bronze can be rebuilt without re-downloading. Not copied to GCS.
 10. **Choosing quarters:** `--quarter 2026q2`, `--from 2024q1 --to 2026q2`, and `--check` to list
@@ -418,6 +423,23 @@ so rough): unzipped text ≈ 45–65 GB (at 8–12x), bronze Parquet ≈ 4.5 GB,
 hour at worst (older quarters are smaller). For the free tiers: full-history bronze alone would
 nearly fill GCS's 5 GB, so full history stays on local disk and the GCS lake holds a recent window
 (8 quarters ≈ 0.4–0.8 GB); BigQuery still gets only the compact gold layer.
+
+**Other quarters ingested with the same command** (checking the extrapolation):
+
+| Quarter | num rows | ZIP |
+|---|---|---|
+| 2009q1 | 0 | 13 KB |
+| 2009q2 | 3,999 | 0.1 MB |
+| 2009q3 | 126,650 | 3.4 MB |
+| 2015q1 | 3,322,479 | 94.4 MB |
+| 2026q2 | 3,608,711 | 57.6 MB |
+| 2026q3 | 3,905,397 | 62.1 MB |
+
+The three quarters sampled from 2015 on all sit between 3.3M and 3.9M figures, which suggests a
+steady volume (not checked in between), with the first few quarters tiny - so the full history is
+on the order of 200M figures (rough). 2009q1 has no figures at all and ingests as an empty table
+without error. The ~12x unzipped ratio was measured on 2026q2 only; 2015q1's ZIP is larger than
+2026q2's for a similar row count, so older quarters may compress differently.
 
 **Findings from the first real run** (what the readme and the synthetic tests didn't tell us):
 - **The files are CSV-style quoted** - see item 4's reader settings.
@@ -478,8 +500,8 @@ nearly fill GCS's 5 GB, so full history stays on local disk and the GCS lake hol
   covers about one extra weekend.
 - **The size estimate (checked in Step 6, extrapolated from one quarter):** the original 30–40 GB
   guess was low; one measured quarter (685 MB unzipped) implies roughly 45–65 GB - still far
-  beyond a laptop's memory, so D2's reasoning holds. Re-check against a few older quarters before
-  relying on the exact figure.
+  beyond a laptop's memory, so D2's reasoning holds. Older quarters (2009q1-q3, 2015q1) ingested
+  and their row counts fit the picture, but the unzipped ratio is still from 2026q2 alone.
 - **The SEC changes its format again** — the bronze schema contract fails loudly, and Great
   Expectations checks bronze from Phase 10.
 - **Spark image on GHCR** — Cloud Run caches public images for up to an hour; fine for a weekly

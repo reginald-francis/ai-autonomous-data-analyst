@@ -4,8 +4,8 @@
 scoped to roughly one weekend at ~10 hrs/week, has its own branch, and ends mergeable. Work
 **one phase per chat session** — read this file first to find the current phase.
 
-**Last updated:** 2026-10-05 · **Current phase:** 6 — Ingestion, in progress ·
-**Branch:** `claude/v8-ingestion`
+**Last updated:** 2026-10-13 · **Current phase:** 6 — Ingestion, done on `claude/v8-ingestion`
+(PR to `main` pending) · **Next:** 7 — `claude/v9-spark-lakehouse` (not yet cut)
 
 ---
 
@@ -59,7 +59,7 @@ testing?"
 | 4 | Dynamic data context | `claude/v6.3-data-context` | 1 | Sep 2026 | ✅ Done |
 | 4b | User-supplied RAG context | `claude/v6.4-rag-context` | 1 | Sep 2026 | ✅ Done |
 | 5 | Docker + Cloud Run + security | `claude/v7-deploy` | 2 | Sep–Oct 2026 | ✅ |
-| 6 | Ingestion: SEC EDGAR → bronze Parquet | `claude/v8-ingestion` | 1 | Oct 2026 | ⬜ |
+| 6 | Ingestion: SEC EDGAR → bronze Parquet | `claude/v8-ingestion` | 1 | Oct 2026 | ✅ Done |
 | 7 | Spark + Delta Lake: bronze → silver → gold; gold → BigQuery | `claude/v9-spark-lakehouse` | 2 | Oct 2026 | ⬜ |
 | 8 | Data-source abstraction; agent reads gold | `claude/v10-warehouse-serving` | 2 | Nov 2026 | ⬜ |
 | 9 | Airflow (Docker) + Cloud Scheduler + Workflows | `claude/v11-orchestration` | 2 | Nov 2026 | ⬜ |
@@ -613,9 +613,9 @@ zero-cost mandate); `/ask` rejects traversal (already true).
 
 ---
 
-## Phase 6 — Ingestion ⬜
+## Phase 6 — Ingestion ✅
 
-**Branch:** `claude/v8-ingestion` · **1 weekend**
+**Branch:** `claude/v8-ingestion` · **1 weekend** · **Completed 2026-10-13** (PR to `main` pending)
 
 ### Source: SEC EDGAR Financial Statement Data Sets (decided 2026-10-03)
 
@@ -631,13 +631,31 @@ Volume control still applies: BigQuery's free tier is 10 GB storage / 1 TB queri
 so the warehouse holds only the compact gold layer, and ingestion is incremental — one quarter
 at a time.
 
-**Added:** `ingestion/` (`cli.py`, `storage.py`, `sources/sec_fsds.py`),
-`requirements-ingestion.txt`, and unit tests with mocked HTTP and a fixture ZIP (never the
-network). CLI: `python -m ingestion --source sec_fsds --quarter 2026q2`, plus `--check`.
+**Implemented** (`ingestion/`): a CLI — `python -m ingestion --source sec_fsds --quarter 2026q2`,
+or `--from/--to`, `--check`, `--force` — over a pipeline that skips a quarter whose SEC
+`Last-Modified` matches its manifest, rebuilds from the saved ZIP when only the schema version
+moved, or downloads (streamed, atomic, retried). `write_bronze()` converts the four tables to
+typed Parquet in a staging folder and writes the manifest last as the commit marker, so a failed
+rebuild never corrupts the last good one. A failed quarter is reported (exit code 1) without
+stopping the rest of a range. Schemas for all four tables are transcribed from the SEC's own
+field definitions. Every module has unit tests with all HTTP mocked, and `--cov=ingestion`
+joined CI's coverage gate.
 
-**Done when:** the CLI ingests one quarter to partitioned local bronze Parquet, idempotently,
-with a row-count assertion; one real quarter's row counts and sizes are recorded in
-`docs/PHASE6_DESIGN.md`.
+**Verified on a real quarter (2026q2):** 7,714 filings and 3.6M reported figures; 58 MB zipped,
+685 MB unzipped, ~48 MB as Parquet; a full rebuild takes 53 s, and a re-run with unchanged
+headers downloads nothing. The full history extrapolates to ~45–65 GB unzipped and ~4.5 GB of
+bronze Parquet, so it stays on local disk (`docs/PHASE6_DESIGN.md` section 5).
+
+**What the real data taught us** (the readme and the synthetic tests missed all of it): the
+files are CSV-style quoted — the first run failed on a tab inside a quoted value, and quoted
+values without a tab would have loaded silently corrupted; the SEC sends `Last-Modified` but no
+`ETag`; foreign filers (20-F, 6-K) are in the data but their country fields are often blank —
+Infosys and Wipro have both NULL, so `countryba = 'IN'` finds nothing; the SEC's text drops some
+non-ASCII characters.
+
+**Done when:** ✅ the CLI ingests a quarter to partitioned local bronze Parquet, idempotently,
+with an independent row-count check on every table; real row counts and sizes are recorded.
+Known gaps for later phases are risks #28–#32.
 
 ---
 
@@ -659,6 +677,11 @@ period dimensions, with company name history as SCD Type 2).
 Silver does the cleanup SEC data demands: explicit types, schema differences across years
 (`segments`), the latest-filed value per company/metric/period, standard metric names, and a
 derived Q4.
+
+**Carry-ins from Phase 6** (`docs/PHASE6_DESIGN.md`, "Findings"): country enrichment, because
+`countryba`/`countryinc` are often NULL for foreign filers; the concept map may need IFRS tags
+(`ifrs-full`) as well as `us-gaap` for 20-F filers (unverified); and NUM's key includes the
+nullable `segments` and `coreg`, so MERGE needs null-safe matching.
 
 **⚠️ This is the phase where money is possible.** BigQuery free tier: 10 GB storage, **1 TB
 queried/month**. Before the first load: confirm the **$1 budget alert** is still active, set a
@@ -718,6 +741,10 @@ touch it.
 
 Deployed path: Cloud Scheduler (weekly) → Cloud Workflows → Cloud Run Jobs, all inside free tiers
 (Scheduler: 3 jobs; Workflows: 5,000 steps/month). Airflow is the local, demonstrable artifact.
+
+**Carry-ins from Phase 6:** risks #28–#31 — the lake is local-only until a
+write-locally-then-upload step exists; request throttling; automatic quarter selection (a 404
+for an unpublished quarter means "not yet", not a failure); one ingestion run at a time.
 
 **Interview answer:** "I built the DAG in Airflow because it's the industry standard and I
 wanted to learn its execution model, but deployed on Cloud Scheduler because Composer costs
@@ -972,8 +999,13 @@ during Phases 1–13.
 | 23 | RAG's embedding model, `all-MiniLM-L6-v2` (see Phase 5's ONNX swap), is a mid-tier, 2021-era model on MTEB retrieval benchmarks — newer small models (`bge-small-en-v1.5`, `e5-small-v2`, etc.) generally score higher at similar or smaller size. Kept for Phase 5 because (a) this app's actual retrieval task — matching a question against short, plainly-worded, user-authored glossary sentences — is close to the easiest realistic case for any embedding model (validated: the one genuinely-related sentence pair scored 0.76 similarity vs. ~0.0-0.18 for unrelated pairs, an unambiguous gap), (b) it has well-established, battle-tested pre-converted ONNX exports, lowering conversion risk for a phase already doing something new, and (c) model choice is orthogonal to Phase 5's actual done-criteria (deployability/security), so churning it now would mean redoing the quality-parity validation for a change unlikely to be observable in this app's real inputs. Raised 2026-09-17 during the ONNX swap — not a defect, a candidate low-cost upgrade (reuse `scripts/validate_onnx_embedder.py`/`validate_retrieval_threshold.py` against a new candidate model) once the deploy itself is stable. | Low | Candidate — revisit post-5 or ad hoc |
 | 24 | `rag_service.py`'s `split_into_chunks()` splits only on blank-line paragraph breaks and drops anything under 5 words — a single unformatted paragraph becomes one giant chunk, and short-but-real definitions (e.g. "Won = closed-won deal.") can be silently dropped. Raised 2026-10-03 as an idea to have an LLM do the chunking instead; recommendation after discussion: a deterministic improvement (sentence-aware splitting, a small overlap between adjacent chunks, a lower/smarter word floor) fits this project's established "LLM for judgment calls, deterministic code for mechanical work" pattern (see Phase 4's chart-agent redesign) better than an LLM chunking call would. Not a defect — this hasn't caused an observed bad result yet — a candidate improvement. | Low | Candidate — revisit ad hoc |
 | 25 | Phase 7 overrun — learning Spark and the SEC format at the same time | Medium | 7 |
-| 26 | Full-history size (estimated 30–40 GB unzipped) is unverified; measured in Phase 6 Step 6. If it fits comfortably in memory, revisit the larger-than-memory reasoning for Spark (`docs/PHASE6_DESIGN.md` D2) | Low | 6, 7 |
+| 26 | ~~Full-history size (estimated 30–40 GB unzipped) is unverified~~ — **Checked in Phase 6 Step 6:** one real quarter is 685 MB unzipped (12x its ZIP), so all 70 extrapolate to ~45–65 GB — still beyond a laptop's memory, so the larger-than-memory reasoning for Spark holds (`docs/PHASE6_DESIGN.md` D2). Bronze Parquet for the full history would be ~4.5 GB, so it stays on local disk and the GCS lake holds a recent window. Extrapolated from one quarter; re-check against a few older ones | Low | 6 ✅, 7 |
 | 27 | GCP Professional Data Engineer exam (Dec 2026/Jan 2027) competes for the same ~10 hrs/week as Phases 7–9; timeline to be aligned once the exam plan is shared | Medium | 7–9 |
+| 28 | **The `gs://` claim doesn't hold yet.** `docs/PHASE6_DESIGN.md` item 8 and `ingestion/config.py`'s docstring say Phase 9 can point `INGESTION_LAKE_ROOT` at `gs://` with no code change, but `storage.py`, `sec_fsds_bronze.py` and `download_quarter()` use local-only calls (`open`, `os.replace`, `shutil.rmtree`, `os.makedirs`). Phase 9 needs a write-locally-then-upload step or a filesystem abstraction. GCS writes are atomic per object, so uploading the manifest last keeps it the commit marker. Raised 2026-10-13 in the Step 6 pre-commit review. | Medium | 9 |
+| 29 | **No request throttle.** The SEC's 10 requests/second limit is documented (`docs/PHASE6_DESIGN.md` D10) but not enforced. A `--check` over many quarters sends back-to-back HEAD requests — about 3/s from a laptop, but fast enough from GCP to exceed the limit and get temporarily blocked. Add a small delay between requests before any large backfill. | Medium | 7, 9 |
+| 30 | **No automatic quarter selection.** The CLI needs an explicit `--quarter` or `--from/--to`. Phase 9's weekly job must pick quarters itself (e.g. the latest two by date) and treat a 404 for a not-yet-published quarter as "not available yet", not a failure — otherwise it raises a false alarm (exit code 1) every week. Related: `--check` reports `would_ingest` for a quarter that doesn't exist (e.g. `2030q1`), because it makes no network call for never-ingested quarters. | Medium | 9 |
+| 31 | **No locking.** Two ingestion runs on the same quarter at once would collide in its `_staging/<quarter>/` folder. Phase 9 must run one ingestion job at a time (Cloud Run Job parallelism 1, Workflows steps in sequence). | Low | 9 |
+| 32 | **Row-count check's field limit.** `_count_data_rows()` uses Python's `csv` module, whose default field limit is 128 KB; a longer quoted value would raise `csv.Error`, which isn't a `BronzeError`, so it would crash a backfill instead of failing one quarter. Not seen so far: 2009q1–q3, 2015q1, 2026q2 and 2026q3 all ingested cleanly. | Low | Revisit if seen |
 
 ## Cost summary — free tiers only
 
