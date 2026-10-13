@@ -45,6 +45,26 @@ def quarter_zip_url(quarter: str) -> str:
     return f"{BASE_URL}/{quarter}.zip"
 
 
+def quarters_in_range(start: str, end: str) -> list[str]:
+    """Every quarter from start to end inclusive, oldest first.
+
+    quarters_in_range("2025q4", "2026q2") -> ["2025q4", "2026q1", "2026q2"]
+
+    Raises QuarterFormatError for a malformed quarter, and ValueError if
+    start is after end - almost certainly swapped arguments, and an empty
+    list would silently ingest nothing and look like success.
+    """
+    start_year, start_q = parse_quarter(start)
+    end_year, end_q = parse_quarter(end)
+    # Count quarters as one number (2025q4 -> 2025*4 + 3) so the loop needs
+    # no "roll over from Q4 to next year's Q1" logic.
+    first = start_year * 4 + (start_q - 1)
+    last = end_year * 4 + (end_q - 1)
+    if first > last:
+        raise ValueError(f"start quarter {start!r} is after end quarter {end!r}")
+    return [f"{n // 4}q{n % 4 + 1}" for n in range(first, last + 1)]
+
+
 def _is_transient(exc: Exception) -> bool:
     """True for failures worth retrying: network-level issues, and 5xx
     server errors (often transient - an overloaded server, a brief outage).
@@ -142,7 +162,7 @@ def needs_download(quarter: str, lake_root: str, user_agent: str) -> bool:
     enough information to safely say "unchanged": no existing manifest,
     missing headers on either side, or a HEAD request that fails for any
     reason. This function can only ever cause an *extra* download, never a
-    missed one - has_quarter_changed()'s full sha256 comparison after a real
+    missed one - write_bronze()'s full sha256 comparison after a real
     download remains the authoritative check.
     """
     existing = storage.read_manifest(lake_root, quarter)
@@ -172,17 +192,3 @@ def sha256_of_file(path: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def has_quarter_changed(quarter: str, zip_path: str, lake_root: str) -> bool:
-    """True if this quarter has never been ingested, or its freshly downloaded
-    ZIP's hash differs from the one recorded in the existing manifest - e.g.
-    the SEC republished it (see the Dec 2024 full-history republication,
-    docs/PHASE6_DESIGN.md section 4). This is the authoritative check, run
-    after a real download - unlike needs_download()'s cheap header pre-check,
-    this always correctly detects a real content change.
-    """
-    existing = storage.read_manifest(lake_root, quarter)
-    if existing is None:
-        return True
-    return sha256_of_file(zip_path) != existing.get("sha256")

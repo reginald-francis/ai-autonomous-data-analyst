@@ -6,7 +6,7 @@ platform's data comes from and how Phases 6–10 process it, plus Phase 6's own 
 phases and interview answers don't depend on chat history.
 
 **Status:** decisions D1–D11 locked 2026-10-03/05. Section 5 (ingestion design) locked
-2026-10-06, with Step 4-5 refinements recorded inline. **Last updated:** 2026-10-11.
+2026-10-06, with Step 4-6 refinements recorded inline. **Last updated:** 2026-10-13.
 
 ## 1. Why this document exists
 
@@ -95,8 +95,8 @@ course-homework dataset.
 
 ### D2 — PySpark is the transformation engine; dbt is dropped
 
-**Why a larger-than-memory engine is required:** the full SEC history (estimated 30–40 GB
-unzipped; measured in Step 6) is larger than the memory of any machine this project runs on —
+**Why a larger-than-memory engine is required:** the full SEC history (roughly 45–65 GB
+unzipped, extrapolated from one measured quarter - see section 5) is larger than the memory of any machine this project runs on —
 a laptop or a Cloud Run job — and pandas would need several times that in RAM. Resolving
 restatements also needs every quarter at once: a regrouping across all of history, not a
 quarter-at-a-time job.
@@ -337,8 +337,13 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
      exactly as published; enforcing the SEC's "May be NULL: No" belongs to Phase 10.
    - **`SCHEMA_VERSION`:** recorded in every manifest; bumping it makes the bronze writer
      rebuild each quarter from its landing ZIP, with no re-download.
-   **Reader settings** (in `ingestion/sources/sec_fsds_bronze.py`): tab-delimited, quoting
-   disabled (the spec's files are unquoted, so `"` is ordinary text); **only an empty field is
+   **Reader settings** (in `ingestion/sources/sec_fsds_bronze.py`): tab-delimited and
+   **CSV-style quoted** — the readme describes plain TSV, but a real 2026q2 `num.txt` wraps any
+   value containing a quote, tab or newline in double quotes, with inner quotes doubled (`""`).
+   Found when the first real run failed with "Expected 10 columns, got 11" (a tab inside a
+   quoted `segments` value). With quoting off, quoted values without a tab would have loaded
+   silently with their wrapper quotes - which no row count catches - so quoting is on
+   (`quote_char='"'`, `double_quote`, `newlines_in_values`); **only an empty field is
    NULL** — pyarrow's defaults would also null out `"NA"`, which is Namibia's ISO country code;
    whitespace trimmed before converting non-text fields only (text is kept byte-for-byte);
    streamed in batches so memory stays bounded however large `num.txt` is; Parquet compressed
@@ -349,7 +354,9 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
    (`os.replace`, atomic per file), and the manifest is written **last** as the commit marker.
    Any failure before that leaves the previous manifest in place, so the next run sees the
    quarter as changed and rebuilds it — a failed rebuild never corrupts the last good build.
-   Row counts are checked against an independent count of each source file's data lines.
+   Row counts are checked against an independent, quote-aware count of each source file's
+   records, made with Python's `csv` module rather than pyarrow - a second parser, so a shared
+   parsing mistake can't fool both.
    A re-run is a no-op when the manifest's sha256 and `SCHEMA_VERSION` match and all four
    files exist; `force=True` rebuilds anyway.
 6. **HTTP client:** `requests` over `httpx` — simple, and already a real dependency elsewhere in
@@ -396,8 +403,41 @@ Structured Streaming in Docker); deployed, it needs always-on compute, which has
     ship with zero test coverage and CI would still pass, since `--cov=src` alone never looks at
     it.
 
-**Measurements (filled in at Step 6):** rows per table, ZIP size, Parquet size and run time for
-one quarter, plus the extrapolated full-history size against BigQuery's 10 GiB and GCS's 5 GB.
+**Measurements (Step 6, first real run, 2026q2, 2026-10-12):**
+
+| | Measured |
+|---|---|
+| Rows | sub 7,714 · num 3,608,711 · tag 92,731 · pre 785,490 |
+| ZIP | 57.6 MB (60,419,016 bytes) |
+| Unzipped text | 685 MB (about 12x the ZIP) |
+| Bronze Parquet (zstd) | ~48 MB: num 33.7, pre 9.4, tag 4.4, sub 0.7 - about 0.84x the ZIP, ~14x smaller than the unzipped text |
+| Full rebuild | 52.7 s including the download; a re-run with unchanged headers downloads nothing |
+
+**Extrapolated to all 70 quarters** (the SEC's listed ZIPs total ~5.4 GB; ratios from one quarter,
+so rough): unzipped text ≈ 45–65 GB (at 8–12x), bronze Parquet ≈ 4.5 GB, a full backfill about an
+hour at worst (older quarters are smaller). For the free tiers: full-history bronze alone would
+nearly fill GCS's 5 GB, so full history stays on local disk and the GCS lake holds a recent window
+(8 quarters ≈ 0.4–0.8 GB); BigQuery still gets only the compact gold layer.
+
+**Findings from the first real run** (what the readme and the synthetic tests didn't tell us):
+- **The files are CSV-style quoted** - see item 4's reader settings.
+- **The SEC sends `Last-Modified` but no `ETag`.** The cheap header check works through
+  `last_modified`; `etag` is stored as null. Confirmed: a re-run printed "SEC headers match the
+  manifest; nothing downloaded".
+- **Foreign filers are in the data:** 20-F (521) and 6-K (104) filings sit beside 10-Q (5,321),
+  11-K (731) and 10-K (570). About 8% of filings record a non-US business address (CA, CN, HK, SG,
+  GB, IE, KY, IL lead).
+- **The country columns are unreliable for foreign filers.** `countryba` is NULL for 268 of 521
+  20-F filings and 582 of 7,714 filings overall. Infosys and Wipro are in the data (20-F) with
+  both `countryba` and `countryinc` NULL; Dr. Reddy's has `countryinc = IN` but `countryba` NULL.
+  A filter on `countryba = 'IN'` finds nothing even though Indian companies are present - country
+  enrichment belongs in Phase 7's silver layer.
+- **Foreign filers probably use IFRS tags, not us-gaap** (they report under IFRS) - unverified;
+  if so, Phase 7's concept map must cover both taxonomies.
+- **The SEC's text appears to drop some non-ASCII characters:** 18 rows (14 distinct footnotes)
+  contain doubled quotes; the samples seen read `Euro ("")` and `British Pound ("")`, where a
+  currency symbol (€, £) evidently was, while `$`, `A$` and `C$` survive. A source-data quirk,
+  not ours (inferred from three samples) - relevant to Phase 10.
 
 ## 6. Interview talking points
 
@@ -436,9 +476,10 @@ one quarter, plus the extrapolated full-history size against BigQuery's 10 GiB a
 
 - **Phase 7 overrun** — learning Spark and the SEC format at the same time. The plan's slack
   covers about one extra weekend.
-- **The size estimate is unverified** — 30–40 GB is an estimate. Step 6 measures one quarter and
-  extrapolates; if the full history turns out to fit comfortably in memory, revisit D2's
-  larger-than-memory reasoning.
+- **The size estimate (checked in Step 6, extrapolated from one quarter):** the original 30–40 GB
+  guess was low; one measured quarter (685 MB unzipped) implies roughly 45–65 GB - still far
+  beyond a laptop's memory, so D2's reasoning holds. Re-check against a few older quarters before
+  relying on the exact figure.
 - **The SEC changes its format again** — the bronze schema contract fails loudly, and Great
   Expectations checks bronze from Phase 10.
 - **Spark image on GHCR** — Cloud Run caches public images for up to an hour; fine for a weekly

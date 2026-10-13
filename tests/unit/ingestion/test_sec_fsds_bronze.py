@@ -5,8 +5,10 @@ data) from the Python rows below, so the tab-separated content is exact and
 readable here rather than hidden in a binary fixture file.
 """
 
+import csv
 import datetime
 import decimal
+import io
 import logging
 import os
 import zipfile
@@ -70,9 +72,18 @@ PRE_ROWS = [
 
 
 def _tsv(table, rows, header=None):
+    """Tab-separated text written the way the SEC writes it: a value containing
+    a quote, a tab or a newline is wrapped in double quotes, with quotes inside
+    doubled. That is Python's csv module's default - and what a real 2026q2
+    num.txt turned out to contain, despite the readme describing plain TSV.
+    """
     header = header or [f.name for f in sec_fsds_schema.fields_for(table)]
-    lines = ["\t".join(header)] + ["\t".join(row.get(col, "") for col in header) for row in rows]
-    return "\n".join(lines) + "\n"
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter="\t", lineterminator="\n")
+    writer.writerow(header)
+    for row in rows:
+        writer.writerow([row.get(col, "") for col in header])
+    return buffer.getvalue()
 
 
 def _default_members():
@@ -162,10 +173,48 @@ class TestSuccessfulWrite:
         assert rows[0]["qtrs"] == 4
         assert rows[1]["segments"] == "BusinessSegments=Services;"
 
-    def test_quote_characters_are_kept_as_plain_text(self, zip_path, lake_root):
+    def test_quoted_value_with_doubled_quotes_is_unwrapped(self, zip_path, lake_root):
+        # TAG_ROWS' doc contains quote characters, so _tsv wrote it as the SEC does:
+        # wrapped in quotes, inner quotes doubled. Guard that the fixture really is
+        # quoted - otherwise this test would prove nothing.
+        with zipfile.ZipFile(zip_path) as zf:
+            assert '""including""' in zf.read("tag.txt").decode("utf-8")
+
         sec_fsds_bronze.write_bronze(QUARTER, zip_path, lake_root)
+
         doc = _read(lake_root, "tag").to_pylist()[0]["doc"]
         assert doc == 'Amount of revenue, "including" literal quote characters.'
+
+    def test_value_containing_a_tab_stays_one_field(self, tmp_path, lake_root):
+        # The real-data bug: a quoted value with a tab inside it was split in two,
+        # shifting every later column ("Expected 10 columns, got 11").
+        tabbed = "InvestmentIdentifier=Rock Gate\tCapital, LLC | First lien;"
+        members = _default_members()
+        members["num.txt"] = _tsv("num", [dict(NUM_ROWS[0], segments=tabbed, value="0.0675")])
+        assert f'"{tabbed}"' in members["num.txt"]  # the fixture really is quoted
+        path = _write_zip(tmp_path / "tab_in_value.zip", members)
+
+        result = sec_fsds_bronze.write_bronze(QUARTER, path, lake_root)
+
+        row = _read(lake_root, "num").to_pylist()[0]
+        assert row["segments"] == tabbed
+        assert row["value"] == decimal.Decimal("0.0675")  # still in the right column
+        assert result.manifest["row_counts"]["num"] == 1
+
+    def test_value_containing_a_newline_is_one_record(self, tmp_path, lake_root):
+        # Counting physical lines would see 6 here (header + 3 rows + a 2-line row)
+        # against 5 records, and wrongly report a row-count mismatch.
+        footnote = "First line.\nSecond line."
+        members = _default_members()
+        members["num.txt"] = _tsv("num", NUM_ROWS + [dict(NUM_ROWS[0], footnote=footnote)])
+        path = _write_zip(tmp_path / "newline_in_value.zip", members)
+
+        result = sec_fsds_bronze.write_bronze(QUARTER, path, lake_root)
+
+        rows = _read(lake_root, "num").to_pylist()
+        assert len(rows) == 4
+        assert rows[3]["footnote"] == footnote
+        assert result.manifest["row_counts"]["num"] == 4
 
     def test_unexpected_zip_member_is_ignored_with_a_warning(self, tmp_path, lake_root, caplog):
         members = _default_members()
@@ -246,6 +295,29 @@ class TestFailures:
             sec_fsds_bronze.write_bronze(QUARTER, path, lake_root)
         assert _nothing_written(lake_root)
 
+    def test_file_that_is_not_a_zip_raises_corrupt_zip_and_writes_nothing(self, tmp_path, lake_root):
+        path = tmp_path / "not_a_zip.zip"
+        path.write_bytes(b"this is not a zip file")
+
+        with pytest.raises(sec_fsds_bronze.CorruptZipError, match="not a readable ZIP"):
+            sec_fsds_bronze.write_bronze(QUARTER, str(path), lake_root)
+        assert _nothing_written(lake_root)
+
+    def test_corrupt_byte_inside_a_valid_zip_raises_corrupt_zip(self, zip_path, lake_root):
+        # The ZIP still opens (its index is intact), but sub.txt's stored checksum
+        # no longer matches its contents - only noticed once the member is read.
+        # sub.txt is stored uncompressed, so its text is findable; the replacement
+        # has the same length so every offset in the file stays valid.
+        with open(zip_path, "rb") as f:
+            data = f.read()
+        assert b"EXAMPLE CORP" in data
+        with open(zip_path, "wb") as f:
+            f.write(data.replace(b"EXAMPLE CORP", b"EXAMPLE CORQ"))
+
+        with pytest.raises(sec_fsds_bronze.CorruptZipError, match="Bad CRC"):
+            sec_fsds_bronze.write_bronze(QUARTER, zip_path, lake_root)
+        assert _nothing_written(lake_root)
+
     def test_unexpected_column_raises_schema_mismatch(self, tmp_path, lake_root):
         members = _default_members()
         header = [f.name for f in sec_fsds_schema.fields_for("tag")] + ["brand_new_column"]
@@ -286,6 +358,12 @@ class TestFailures:
         # last good build - and that build's files are untouched.
         assert storage.read_manifest(lake_root, QUARTER) == first.manifest
         assert _read(lake_root, "num").num_rows == 3
+
+
+def test_count_data_rows_treats_a_quoted_newline_as_one_record(tmp_path):
+    path = _write_zip(tmp_path / "count_quoted.zip", {"x.txt": 'header\n"a\nb"\nrow2\n'})
+    with zipfile.ZipFile(path) as zf:
+        assert sec_fsds_bronze._count_data_rows(zf, "x.txt") == 2
 
 
 def test_count_data_rows_skips_the_header_and_blank_lines(tmp_path):

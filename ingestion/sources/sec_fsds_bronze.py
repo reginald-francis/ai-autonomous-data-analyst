@@ -8,7 +8,7 @@ Flow for write_bronze(quarter, zip_path, lake_root):
      the TSV in batches (memory stays bounded however big num.txt is), apply
      the explicit types, and write Parquet into a _staging folder.
   3. Check each table's row count against an independent count of the
-     source file's data lines.
+     source file's data records.
   4. Only once all four tables succeeded: move each staged file into its
      final partition (os.replace, atomic per file), then write the manifest
      LAST - it's the commit marker. A crash anywhere before that leaves the
@@ -18,6 +18,8 @@ Flow for write_bronze(quarter, zip_path, lake_root):
 readme.htm (SEC documentation, not data) is skipped by design.
 """
 
+import csv
+import io
 import logging
 import os
 import shutil
@@ -45,6 +47,10 @@ class BronzeError(Exception):
 
 class MissingTableError(BronzeError):
     """A table file (e.g. num.txt) is missing from the ZIP."""
+
+
+class CorruptZipError(BronzeError):
+    """The ZIP can't be read - typically a truncated or damaged download."""
 
 
 class SchemaMismatchError(BronzeError):
@@ -105,6 +111,15 @@ def write_bronze(
             final_file = storage.bronze_table_file(lake_root, table, quarter)
             os.makedirs(os.path.dirname(final_file), exist_ok=True)
             os.replace(os.path.join(staging_dir, f"{table}.parquet"), final_file)
+    except zipfile.BadZipFile as e:
+        # Raised either when opening the ZIP (not a ZIP at all, or truncated) or
+        # part-way through reading a member (CRC mismatch) - both mean a damaged
+        # download. A BronzeError, so run_ingest() records a failed quarter and
+        # carries on instead of crashing a whole backfill.
+        raise CorruptZipError(
+            f"{quarter}: {os.path.basename(zip_path)} is not a readable ZIP "
+            f"(damaged or truncated download?): {e}"
+        ) from e
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -176,13 +191,16 @@ def _validate_header(table: str, header: list[str]) -> None:
 
 
 def _count_data_rows(zf: zipfile.ZipFile, member: str) -> int:
-    """Count the source file's non-empty lines minus the header - an
-    independent check on the parser, which also skips empty lines.
+    """Count the source file's records minus the header, using Python's own csv
+    reader - an independent check on pyarrow's parser. It is quote-aware: a
+    quoted value containing a newline is still one record, which counting
+    physical lines would get wrong. Empty lines are skipped, as pyarrow skips them.
     """
     count = 0
     with zf.open(member) as f:
-        for line in f:
-            if line.strip(b"\r\n"):
+        text = io.TextIOWrapper(f, encoding="utf-8", newline="")
+        for record in csv.reader(text, delimiter="\t", quotechar='"', doublequote=True):
+            if record:
                 count += 1
     return max(count - 1, 0)
 
@@ -195,9 +213,15 @@ def _convert_table(zf: zipfile.ZipFile, table: str, staged_file: str) -> int:
     schema = sec_fsds_schema.arrow_schema(table)
 
     read_options = pacsv.ReadOptions(column_names=header, skip_rows=1)
-    # The SEC's files are tab-delimited and unquoted (see the readme's "File
-    # Formats" section), so quote characters are ordinary text, not quoting.
-    parse_options = pacsv.ParseOptions(delimiter="\t", quote_char=False)
+    # The readme calls these files plain "tab-delimited", but the real ones are
+    # CSV-style quoted: a value containing a quote, a tab or a newline is wrapped
+    # in double quotes, with embedded quotes doubled ("" -> "). Found on a real
+    # 2026q2 num.txt: with quoting off, a tab inside a quoted value shifted every
+    # later column - and quoted values without a tab were silently kept with their
+    # wrapper quotes, which no row count could have caught.
+    parse_options = pacsv.ParseOptions(
+        delimiter="\t", quote_char='"', double_quote=True, newlines_in_values=True
+    )
     convert_options = pacsv.ConvertOptions(
         # Read everything as text first; _convert_batch applies the real types.
         column_types={name: pa.string() for name in header},
@@ -222,7 +246,7 @@ def _convert_table(zf: zipfile.ZipFile, table: str, staged_file: str) -> int:
     expected_rows = _count_data_rows(zf, member)
     if rows_written != expected_rows:
         raise RowCountMismatchError(
-            f"{table}.txt: wrote {rows_written} rows but the file has {expected_rows} data lines"
+            f"{table}.txt: wrote {rows_written} rows but the file has {expected_rows} data records"
         )
     return rows_written
 

@@ -35,6 +35,41 @@ class TestQuarterZipUrl:
             sec_fsds.quarter_zip_url("not-a-quarter")
 
 
+class TestQuartersInRange:
+    def test_single_quarter_range_returns_just_that_quarter(self):
+        assert sec_fsds.quarters_in_range("2026q2", "2026q2") == ["2026q2"]
+
+    def test_range_within_one_year(self):
+        assert sec_fsds.quarters_in_range("2025q2", "2025q4") == ["2025q2", "2025q3", "2025q4"]
+
+    def test_range_crosses_a_year_boundary(self):
+        assert sec_fsds.quarters_in_range("2025q4", "2026q1") == ["2025q4", "2026q1"]
+
+    def test_partial_first_and_last_years_are_not_padded_to_full_years(self):
+        # Guards against the classic nested-loop bug, which would return all of
+        # 2025 and all of 2026 (8 quarters) instead of just these 4.
+        assert sec_fsds.quarters_in_range("2025q3", "2026q2") == [
+            "2025q3", "2025q4", "2026q1", "2026q2",
+        ]
+
+    def test_full_history_is_every_quarter_exactly_once(self):
+        quarters = sec_fsds.quarters_in_range("2009q1", "2026q2")
+        assert quarters[0] == "2009q1"
+        assert quarters[-1] == "2026q2"
+        # 2009q1 to 2026q2 is 70 quarters - the same count of ZIPs the SEC lists.
+        assert len(quarters) == 70
+        assert len(set(quarters)) == 70
+
+    def test_start_after_end_raises(self):
+        with pytest.raises(ValueError, match="after"):
+            sec_fsds.quarters_in_range("2026q2", "2025q4")
+
+    @pytest.mark.parametrize("start, end", [("bad", "2026q2"), ("2025q1", "2026q5")])
+    def test_malformed_quarter_raises_quarter_format_error(self, start, end):
+        with pytest.raises(sec_fsds.QuarterFormatError):
+            sec_fsds.quarters_in_range(start, end)
+
+
 class FakeStreamedResponse:
     """A minimal stand-in for requests.Response used as a context manager,
     since download_quarter() uses `with requests.get(...) as response:`.
@@ -246,33 +281,3 @@ class TestSha256OfFile:
         path.write_bytes(b"hello world")
         expected = hashlib.sha256(b"hello world").hexdigest()
         assert sec_fsds.sha256_of_file(str(path)) == expected
-
-
-class TestHasQuarterChanged:
-    def test_true_when_no_manifest_exists_yet(self, tmp_path):
-        zip_path = tmp_path / "2026q2.zip"
-        zip_path.write_bytes(b"content")
-        assert sec_fsds.has_quarter_changed("2026q2", str(zip_path), str(tmp_path)) is True
-
-    def test_false_when_hash_matches_existing_manifest(self, tmp_path):
-        zip_path = tmp_path / "2026q2.zip"
-        zip_path.write_bytes(b"content")
-        existing_hash = sec_fsds.sha256_of_file(str(zip_path))
-
-        manifest_path = storage.manifest_path(str(tmp_path), "2026q2")
-        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump({"sha256": existing_hash}, f)
-
-        assert sec_fsds.has_quarter_changed("2026q2", str(zip_path), str(tmp_path)) is False
-
-    def test_true_when_hash_differs_from_existing_manifest(self, tmp_path):
-        zip_path = tmp_path / "2026q2.zip"
-        zip_path.write_bytes(b"new content")
-
-        manifest_path = storage.manifest_path(str(tmp_path), "2026q2")
-        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump({"sha256": "deadbeef"}, f)
-
-        assert sec_fsds.has_quarter_changed("2026q2", str(zip_path), str(tmp_path)) is True
