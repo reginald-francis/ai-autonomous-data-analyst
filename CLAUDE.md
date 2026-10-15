@@ -37,6 +37,9 @@ Phase 11 behind a config flag, never as a replacement.
 - **The owner is new to pyarrow and PySpark.** Explain the concept before the code, keep steps
   small enough to follow, and discuss a phase's purpose, tools, cost and alternatives (with your
   own recommendation) before implementing it.
+- **Plain language first in plan and data-model docs.** Any Phase 7 plan, `docs/DATA_MODEL.md` or
+  similar design document opens with a layman's explanation of the dataset (what the data is,
+  what a row means, what questions it answers), then moves to the technical details.
 - **Verify against real data and sources, not memory or docs.** The SEC's real files contradicted
   its own readme; only a real run caught it.
 - **Never remove existing code comments** unless asked (update one only when it has become false,
