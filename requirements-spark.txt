@@ -1,0 +1,12 @@
+# Spark/Delta Lake dependencies for lakehouse/ (Phase 7) - kept out of
+# requirements.txt (the deployed app image never runs Spark) and out of
+# requirements-ingestion.txt (the ingestion container has no Java). PySpark needs
+# Java 17 on PATH (a system package, not installable from here).
+#
+# Pinned as a pair, checked 2026-10-13: delta-spark 4.4.1's release notes say it
+# is built for Spark 4.2.0, 4.1.0 and 4.0.1, and its pip metadata requires
+# pyspark >=4.0.1,<=4.2.0. Delta's own compatibility page is out of date, so the
+# pair is proven by a smoke test (write a Delta table, read it back), not by that
+# page. Fallback if that fails: pyspark 4.1.x with the same delta-spark.
+pyspark==4.2.0
+delta-spark==4.4.1
