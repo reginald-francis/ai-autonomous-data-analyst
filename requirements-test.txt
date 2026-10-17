@@ -1,0 +1,10 @@
+# The test runner and coverage tools only - nothing from the app or from
+# ingestion. Kept separate so a job that tests one deployable (the `spark` CI job
+# for lakehouse/) installs this plus that deployable's own requirements file and
+# nothing else: if lakehouse/ ever imports a package that requirements-spark.txt
+# does not list, that job fails instead of being quietly satisfied by the app's
+# packages (docs/PHASE7_DESIGN.md D12). requirements-dev.txt pulls this file in
+# via -r, so the versions live in exactly one place.
+pytest==9.1.1
+pytest-cov==7.1.0
+coverage==7.15.4
