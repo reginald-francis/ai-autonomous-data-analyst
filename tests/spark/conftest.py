@@ -4,6 +4,12 @@ Spark tests need PySpark and Java, which only the Spark environment has (WSL on
 the personal laptop, and the `spark` CI job). On a machine without PySpark - the
 corporate laptop running the ordinary suite - the test files in this folder are
 skipped at collection instead of failing on `import pyspark`.
+
+Run them with the flag below. tests/conftest.py is the app's and imports fastapi
+and src.main; the Spark environment (WSL, the `spark` CI job) does not install
+those, so --confcutdir stops pytest loading any conftest.py above this folder:
+
+    python -m pytest tests/spark --confcutdir=tests/spark -v
 """
 
 import importlib.util

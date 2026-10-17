@@ -118,5 +118,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-test.txt -r requirements-spark.txt
 
+      # --confcutdir=tests/spark stops pytest from loading conftest.py files above
+      # that folder. tests/conftest.py is the app's: it imports fastapi and src.main
+      # at the top and has an autouse fixture importing src.services, none of which
+      # this job installs.
       - name: Run Spark tests (coverage gate at 70% on lakehouse/)
-        run: pytest tests/spark --cov=lakehouse --cov-report=term-missing --cov-fail-under=70
+        run: pytest tests/spark --confcutdir=tests/spark --cov=lakehouse --cov-report=term-missing --cov-fail-under=70

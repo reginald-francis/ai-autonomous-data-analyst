@@ -83,6 +83,16 @@ python -m ingestion --source sec_fsds --quarter 2026q2
 python -m ingestion --source sec_fsds --from 2024q1 --to 2026q2 --check    # --check never downloads; --force rebuilds
 ```
 
+**Spark / lakehouse** (bash, in WSL on the personal laptop, from `~/ai-autonomous-data-analyst`;
+needs Java 17 and `requirements-spark.txt`). On the corporate laptop these tests are skipped, not
+run: `tests/spark/conftest.py` ignores them when PySpark is missing.
+
+```bash
+source venv/bin/activate
+pip install -r requirements-test.txt -r requirements-spark.txt
+python -m pytest tests/spark --confcutdir=tests/spark -v    # the flag keeps the app's tests/conftest.py out
+```
+
 **Other:** `python src/groq_all_models.py` lists the Groq models actually live — run it before
 trusting any model ID, since Groq retires them on a short cycle. The API (`POST /upload` with
 `file` + `question`, optionally `context_file`; follow-ups reuse `session_id`) is documented at
@@ -90,7 +100,10 @@ trusting any model ID, since Groq retires them on a short cycle. The API (`POST 
 
 **Dependencies:** `requirements.txt` is runtime-only (the Docker image installs just it).
 `requirements-ingestion.txt` is self-contained for a future ingestion container and pulled into dev
-via `-r`. Verify dependency changes with a fresh venv install, not `pip show` on an old venv — a
+via `-r`. `requirements-spark.txt` (PySpark and Delta Lake, pinned as a pair) is for `lakehouse/`
+only and is deliberately not in the dev file; `requirements-test.txt` holds just pytest, pytest-cov
+and coverage, so the `spark` CI job installs those plus the Spark file and nothing from the app.
+Verify dependency changes with a fresh venv install, not `pip show` on an old venv — a
 drifted venv once hid a missing `huggingface-hub`.
 
 ## Serving layer (`src/`)
