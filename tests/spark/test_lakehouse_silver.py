@@ -18,6 +18,7 @@ from pyspark.sql.types import (
     StructType,
     TimestampType,
 )
+from pyspark.testing import assertDataFrameEqual
 
 from lakehouse import silver
 
@@ -46,6 +47,8 @@ NUM_SCHEMA = StructType(
         StructField("ddate", DateType()),
         StructField("qtrs", IntegerType()),
         StructField("uom", StringType()),
+        StructField("segments", StringType()),
+        StructField("coreg", StringType()),
         StructField("value", DecimalType(28, 4)),
         StructField("quarter", StringType()),
     ]
@@ -63,8 +66,8 @@ def num_rows(adsh):
     """Two figures for one filing: a quarter of revenue and a balance-sheet asset."""
     period_end = date(2026, 3, 31)
     return [
-        (adsh, "Revenues", "us-gaap/2025", period_end, 1, "USD", Decimal("1000.0000"), "2026q2"),
-        (adsh, "Assets", "us-gaap/2025", period_end, 0, "USD", Decimal("5000.0000"), "2026q2"),
+        (adsh, "Revenues", "us-gaap/2025", period_end, 1, "USD", None, None, Decimal("1000.0000"), "2026q2"),
+        (adsh, "Assets", "us-gaap/2025", period_end, 0, "USD", None, None, Decimal("5000.0000"), "2026q2"),
     ]
 
 
@@ -135,3 +138,70 @@ def test_attach_filing_broadcasts_the_filings_side(sub, num, capsys):
 
     joined.explain()
     assert "BroadcastHashJoin" in capsys.readouterr().out
+
+
+def fact_row(
+    tag="Revenues",
+    version="us-gaap/2025",
+    qtrs=1,
+    segments=None,
+    coreg=None,
+    value=Decimal("1.0000"),
+):
+    """One figure of filing A. Every field defaults to a keep-me value, so a test
+    changes only the one thing it is about."""
+    return ("A", tag, version, date(2026, 3, 31), qtrs, "USD", segments, coreg, value, "2026q2")
+
+
+def filtered(spark, *rows):
+    """Run whole_company_standard_facts on a DataFrame built from these rows."""
+    return silver.whole_company_standard_facts(spark.createDataFrame(list(rows), NUM_SCHEMA))
+
+
+def test_whole_company_standard_facts_keeps_a_us_gaap_figure_and_adds_taxonomy(spark):
+    result = filtered(spark, fact_row()).collect()
+
+    assert len(result) == 1
+    assert result[0]["taxonomy"] == "us-gaap"
+
+
+def test_whole_company_standard_facts_keeps_an_ifrs_figure(spark):
+    result = filtered(spark, fact_row(version="ifrs/2025")).collect()
+
+    assert [row["taxonomy"] for row in result] == ["ifrs"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"segments": "BusinessSegments=Cloud;"},  # a business-unit slice
+        {"coreg": "SubsidiaryCo"},  # a co-registrant slice
+        {"version": "0001628280-26-027688"},  # a company-invented tag
+        {"version": "us-gaap-ebp/2026"},  # the employee-benefit-plan rulebook
+        {"value": None},  # no value reported
+    ],
+)
+def test_whole_company_standard_facts_drops_rows_that_should_not_reach_silver(spark, overrides):
+    assert filtered(spark, fact_row(**overrides)).count() == 0
+
+
+def test_whole_company_standard_facts_keeps_qtrs_0_to_4_only(spark):
+    rows = [fact_row(qtrs=qtrs) for qtrs in (0, 1, 2, 3, 4, 5, 113)]
+
+    result = filtered(spark, *rows)
+
+    assert sorted(row["qtrs"] for row in result.collect()) == [0, 1, 2, 3, 4]
+
+
+def test_filtering_before_or_after_the_join_gives_the_same_result(spark, sub, num):
+    slice_row = fact_row(segments="BusinessSegments=Cloud;")
+    mixed = num.unionByName(spark.createDataFrame([slice_row], NUM_SCHEMA))
+    filings = silver.in_scope_filings(sub)
+
+    filter_first = silver.attach_filing(silver.whole_company_standard_facts(mixed), filings)
+    join_first = silver.whole_company_standard_facts(silver.attach_filing(mixed, filings))
+
+    columns = sorted(filter_first.columns)
+    assertDataFrameEqual(filter_first.select(columns), join_first.select(columns))
+    # The in-scope whole-company figures only: A, B and C with two each.
+    assert filter_first.count() == 6

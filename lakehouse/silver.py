@@ -26,6 +26,11 @@ IN_SCOPE_FORMS = [
 ]
 
 
+# The two rulebooks (taxonomies) the concept map covers. `us-gaap-ebp` (employee
+# benefit plans) and company-invented tags are left out (D16).
+TAXONOMIES = ["us-gaap", "ifrs"]
+
+
 def read_bronze(spark: SparkSession, table: str) -> DataFrame:
     """Read one whole bronze table (sub, num, tag or pre), all quarters at once.
 
@@ -57,3 +62,25 @@ def attach_filing(num: DataFrame, filings: DataFrame) -> DataFrame:
     the large table across the machine.
     """
     return num.join(F.broadcast(filings), on="adsh", how="inner")
+
+
+def whole_company_standard_facts(facts: DataFrame) -> DataFrame:
+    """Keep the whole-company figures that use a standard tag, and add `taxonomy`.
+
+    - segments and coreg both NULL: the company's own total, not a business unit,
+      region or co-registrant slice (D16, section 3.3 of the design doc).
+    - `taxonomy` is the text before the "/" in `version` ("us-gaap/2025" gives
+      "us-gaap"). A custom tag's version is an accession number with no "/", so it
+      never equals a known rulebook and is dropped, as is us-gaap-ebp.
+    - qtrs 0 to 4: the 2 and 3 (six and nine months to date) are kept because later
+      steps use them to derive quarters; the odd 5-to-113 tail is dropped.
+    - value not NULL: the SEC allows NULL values, and a NULL from a later filing
+      must not win "latest filed" over a real value from an earlier one.
+    """
+    return (
+        facts.filter(F.col("segments").isNull() & F.col("coreg").isNull())
+        .withColumn("taxonomy", F.split(F.col("version"), "/").getItem(0))
+        .filter(F.col("taxonomy").isin(TAXONOMIES))
+        .filter(F.col("qtrs").between(0, 4))
+        .filter(F.col("value").isNotNull())
+    )
