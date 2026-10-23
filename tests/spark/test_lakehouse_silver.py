@@ -205,3 +205,73 @@ def test_filtering_before_or_after_the_join_gives_the_same_result(spark, sub, nu
     assertDataFrameEqual(filter_first.select(columns), join_first.select(columns))
     # The in-scope whole-company figures only: A, B and C with two each.
     assert filter_first.count() == 6
+
+
+def mapped(spark, *rows):
+    """Filter these rows to whole-company standard figures, then map them to metrics
+    using the real seed files."""
+    return silver.map_to_metrics(
+        filtered(spark, *rows), silver.read_concept_map(spark), silver.read_metrics(spark)
+    )
+
+
+def test_read_concept_map_has_the_columns_and_a_known_row(spark):
+    concept_map = silver.read_concept_map(spark)
+
+    assert concept_map.columns == ["metric", "taxonomy", "tag", "priority"]
+    known = concept_map.filter(
+        "metric = 'net_income' AND taxonomy = 'ifrs' "
+        "AND tag = 'ProfitLossAttributableToOwnersOfParent'"
+    ).collect()
+    assert [row["priority"] for row in known] == [1]
+
+
+def test_read_metrics_has_the_columns_and_the_revenue_rule(spark):
+    metrics = silver.read_metrics(spark)
+
+    assert metrics.columns == [
+        "metric",
+        "description",
+        "statement",
+        "period_type",
+        "resolution_rule",
+    ]
+    revenue = metrics.filter("metric = 'revenue'").collect()[0]
+    assert revenue["resolution_rule"] == "largest"
+    assert revenue["period_type"] == "flow"
+
+
+def test_map_to_metrics_names_the_metric_and_attaches_its_rules(spark):
+    row = mapped(spark, fact_row(tag="Revenues")).collect()[0]
+
+    assert row["metric"] == "revenue"
+    assert row["priority"] == 2
+    assert row["period_type"] == "flow"
+    assert row["resolution_rule"] == "largest"
+
+
+def test_map_to_metrics_drops_tags_that_are_not_in_the_concept_map(spark):
+    assert mapped(spark, fact_row(tag="SomeCompanySpecificDetail")).count() == 0
+
+
+def test_map_to_metrics_does_not_map_us_gaap_profit_loss(spark):
+    # Decision D19: US net income is the parent-only NetIncomeLoss, so the including-
+    # minority ProfitLoss is deliberately unmapped.
+    assert mapped(spark, fact_row(tag="ProfitLoss", version="us-gaap/2025")).count() == 0
+
+
+def test_map_to_metrics_matches_on_taxonomy_and_tag_together(spark):
+    ifrs = mapped(spark, fact_row(tag="ProfitLoss", version="ifrs/2025")).collect()
+    # The same tag name is net income's IFRS fallback, with priority 2 ...
+    assert [(row["metric"], row["priority"]) for row in ifrs] == [("net_income", 2)]
+    # ... and an IFRS-only tag name under us-gaap maps to nothing.
+    assert mapped(spark, fact_row(tag="Revenue", version="us-gaap/2025")).count() == 0
+
+
+def test_map_to_metrics_never_adds_rows(spark):
+    rows = [
+        fact_row(tag="Assets", version="us-gaap/2025", qtrs=0),
+        fact_row(tag="Assets", version="ifrs/2025", qtrs=0),
+    ]
+
+    assert mapped(spark, *rows).count() == 2

@@ -6,6 +6,9 @@ until a result is asked for (Spark is lazy). See docs/PHASE7_DESIGN.md D15-D22 f
 the rules these functions implement.
 """
 
+import csv
+from pathlib import Path
+
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
@@ -25,6 +28,15 @@ IN_SCOPE_FORMS = [
     "40-F/A",
 ]
 
+
+# The small reference files that say which tag is which metric (D18). Read with
+# Python and turned into DataFrames, not read by Spark: they are a handful of rows.
+SEEDS_DIR = Path(__file__).parent / "seeds"
+CONCEPT_MAP_SCHEMA = "metric string, taxonomy string, tag string, priority int"
+METRICS_SCHEMA = (
+    "metric string, description string, statement string, "
+    "period_type string, resolution_rule string"
+)
 
 # The two rulebooks (taxonomies) the concept map covers. `us-gaap-ebp` (employee
 # benefit plans) and company-invented tags are left out (D16).
@@ -83,4 +95,46 @@ def whole_company_standard_facts(facts: DataFrame) -> DataFrame:
         .filter(F.col("taxonomy").isin(TAXONOMIES))
         .filter(F.col("qtrs").between(0, 4))
         .filter(F.col("value").isNotNull())
+    )
+
+
+def _read_seed_rows(name: str) -> list[dict]:
+    """The rows of one seed CSV in lakehouse/seeds/, as dicts keyed by column name."""
+    with open(SEEDS_DIR / name, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def read_concept_map(spark: SparkSession) -> DataFrame:
+    """The concept map as a DataFrame: which (taxonomy, tag) belongs to which metric."""
+    rows = [
+        (r["metric"], r["taxonomy"], r["tag"], int(r["priority"]))
+        for r in _read_seed_rows("concept_map.csv")
+    ]
+    return spark.createDataFrame(rows, CONCEPT_MAP_SCHEMA)
+
+
+def read_metrics(spark: SparkSession) -> DataFrame:
+    """The metric definitions as a DataFrame: statement, period type, conflict rule."""
+    rows = [
+        (r["metric"], r["description"], r["statement"], r["period_type"], r["resolution_rule"])
+        for r in _read_seed_rows("metrics.csv")
+    ]
+    return spark.createDataFrame(rows, METRICS_SCHEMA)
+
+
+def map_to_metrics(facts: DataFrame, concept_map: DataFrame, metrics: DataFrame) -> DataFrame:
+    """Give each figure its standard metric name, and attach that metric's rules.
+
+    Two inner joins, both against tiny tables so both are broadcast:
+    - facts to the concept map on (taxonomy, tag): adds `metric` and `priority`. A
+      figure whose tag is not in the map is dropped - this is where thousands of SEC
+      tags shrink to the eight metrics we track. (taxonomy, tag) is unique in the
+      concept map (tests/spark/test_lakehouse_seeds.py), so rows cannot multiply.
+    - then to the metric definitions on `metric`: adds `period_type` (flow or
+      instant) and `resolution_rule` (largest or priority), used by later steps.
+    `facts` must already have a `taxonomy` column (whole_company_standard_facts).
+    """
+    definitions = metrics.select("metric", "period_type", "resolution_rule")
+    return facts.join(F.broadcast(concept_map), on=["taxonomy", "tag"], how="inner").join(
+        F.broadcast(definitions), on="metric", how="inner"
     )
