@@ -58,9 +58,18 @@ def in_scope_filings(sub: DataFrame) -> DataFrame:
     Keeps only the in-scope forms. Selecting just these columns keeps the table
     small enough to broadcast in the join below, and leaves out `quarter` so the
     joined result does not end up with two columns of that name.
+
+    Also drops a filing with no cik, filed date or accepted time: they identify the
+    company and decide which filing is newest, and a NULL would silently group with
+    other NULLs. None exist in the real data today (measured 2026-10-24), so this is
+    insurance against a future SEC change. `fye` is deliberately allowed to be NULL
+    (91 of 40,794 filings): the figures are still valid, only the fiscal labels are
+    missing.
     """
-    return sub.filter(F.col("form").isin(IN_SCOPE_FORMS)).select(
-        "adsh", "cik", "form", "fye", "filed", "accepted"
+    return (
+        sub.filter(F.col("form").isin(IN_SCOPE_FORMS))
+        .filter(F.col("cik").isNotNull() & F.col("filed").isNotNull() & F.col("accepted").isNotNull())
+        .select("adsh", "cik", "form", "fye", "filed", "accepted")
     )
 
 
@@ -86,8 +95,12 @@ def whole_company_standard_facts(facts: DataFrame) -> DataFrame:
       never equals a known rulebook and is dropped, as is us-gaap-ebp.
     - qtrs 0 to 4: the 2 and 3 (six and nine months to date) are kept because later
       steps use them to derive quarters; the odd 5-to-113 tail is dropped.
-    - value not NULL: the SEC allows NULL values, and a NULL from a later filing
-      must not win "latest filed" over a real value from an earlier one.
+    - value not NULL: the SEC allows NULL values (908,255 of 21.55M rows, 4.2%, in
+      the six quarters measured 2026-10-24), and a NULL from a later filing must not
+      win "latest filed" over a real value from an earlier one.
+    - ddate and uom not NULL: they are part of the silver key, and a NULL would
+      silently group unrelated figures together. None exist in the real data today;
+      this is insurance against a future SEC change.
     """
     return (
         facts.filter(F.col("segments").isNull() & F.col("coreg").isNull())
@@ -95,6 +108,7 @@ def whole_company_standard_facts(facts: DataFrame) -> DataFrame:
         .filter(F.col("taxonomy").isin(TAXONOMIES))
         .filter(F.col("qtrs").between(0, 4))
         .filter(F.col("value").isNotNull())
+        .filter(F.col("ddate").isNotNull() & F.col("uom").isNotNull())
     )
 
 
@@ -137,4 +151,59 @@ def map_to_metrics(facts: DataFrame, concept_map: DataFrame, metrics: DataFrame)
     definitions = metrics.select("metric", "period_type", "resolution_rule")
     return facts.join(F.broadcast(concept_map), on=["taxonomy", "tag"], how="inner").join(
         F.broadcast(definitions), on="metric", how="inner"
+    )
+
+
+def keep_valid_period_shapes(facts: DataFrame) -> DataFrame:
+    """Keep figures whose period length fits their metric's type.
+
+    An `instant` metric (a balance-sheet amount) is a single date, so qtrs must be
+    0; a `flow` metric (income or cash flow) covers a span, so qtrs must not be 0.
+    Anything else is a mislabelled figure and is dropped rather than trusted.
+    """
+    is_instant = F.col("period_type") == "instant"
+    return facts.filter(is_instant == (F.col("qtrs") == 0))
+
+
+def add_periods(facts: DataFrame) -> DataFrame:
+    """Turn ddate and qtrs into exact dates, plus fiscal and calendar labels (D21).
+
+    - period_end: the SEC's ddate (renamed), already rounded to a month end.
+    - period_start: the first day of the month 3 x qtrs - 1 months before the end
+      month; NULL for a single date (qtrs 0). Truncating to a month start means the
+      month-end behaviour of date arithmetic does not matter.
+    - fiscal_quarter: months into the fiscal year (end month minus the fiscal-year-
+      end month from `fye`, wrapped to 1-12) divided by 3, rounded up; NULL for an
+      annual row (qtrs 4), which covers all four quarters.
+    - fiscal_year: the calendar year in which the fiscal year ends - the end date's
+      year if its month is on or before the fiscal-year-end month, otherwise the
+      next year. The filer's own fy/fp are deliberately not used.
+    - calendar_year / calendar_quarter: simply those of the end date. For a company
+      whose fiscal quarters do not line up with calendar quarters this is an
+      approximation, documented in docs/DATA_MODEL.md.
+    `fye` is text like "0630"; its first two characters are the month. If `fye` is
+    NULL, both fiscal labels are NULL (the calendar labels still work).
+    """
+    qtrs = F.col("qtrs")
+    ddate = F.col("ddate")
+    end_month = F.month(ddate)
+    fye_month = F.substring(F.col("fye"), 1, 2).cast("int")
+    wrapped = F.pmod(end_month - fye_month, F.lit(12))
+    months_into_year = F.when(wrapped == 0, 12).otherwise(wrapped)
+
+    return (
+        facts.withColumn("period_start", F.when(qtrs > 0, F.trunc(F.add_months(ddate, -(3 * qtrs - 1)), "month")))
+        .withColumn("fiscal_quarter", F.when(qtrs != 4, F.ceil(months_into_year / 3).cast("int")))
+        .withColumn(
+            "fiscal_year",
+            # Only when fye is known: a NULL comparison counts as false in a CASE
+            # WHEN, so without this guard a missing fye would silently give year + 1.
+            F.when(
+                fye_month.isNotNull(),
+                F.when(end_month <= fye_month, F.year(ddate)).otherwise(F.year(ddate) + 1),
+            ),
+        )
+        .withColumn("calendar_year", F.year(ddate))
+        .withColumn("calendar_quarter", F.quarter(ddate))
+        .withColumnRenamed("ddate", "period_end")
     )

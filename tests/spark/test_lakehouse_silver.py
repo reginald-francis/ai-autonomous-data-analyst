@@ -58,8 +58,8 @@ FILED = date(2026, 4, 29)
 ACCEPTED = datetime(2026, 4, 29, 16, 5, 0)
 
 
-def sub_row(adsh, cik, form):
-    return (adsh, cik, "SOME CO", form, "0630", FILED, ACCEPTED, "2026q2")
+def sub_row(adsh, cik, form, fye="0630", filed=FILED, accepted=ACCEPTED):
+    return (adsh, cik, "SOME CO", form, fye, filed, accepted, "2026q2")
 
 
 def num_rows(adsh):
@@ -147,10 +147,12 @@ def fact_row(
     segments=None,
     coreg=None,
     value=Decimal("1.0000"),
+    ddate=date(2026, 3, 31),
+    uom="USD",
 ):
     """One figure of filing A. Every field defaults to a keep-me value, so a test
     changes only the one thing it is about."""
-    return ("A", tag, version, date(2026, 3, 31), qtrs, "USD", segments, coreg, value, "2026q2")
+    return ("A", tag, version, ddate, qtrs, uom, segments, coreg, value, "2026q2")
 
 
 def filtered(spark, *rows):
@@ -179,6 +181,8 @@ def test_whole_company_standard_facts_keeps_an_ifrs_figure(spark):
         {"version": "0001628280-26-027688"},  # a company-invented tag
         {"version": "us-gaap-ebp/2026"},  # the employee-benefit-plan rulebook
         {"value": None},  # no value reported
+        {"ddate": None},  # no period end date: part of the silver key
+        {"uom": None},  # no unit: part of the silver key
     ],
 )
 def test_whole_company_standard_facts_drops_rows_that_should_not_reach_silver(spark, overrides):
@@ -275,3 +279,113 @@ def test_map_to_metrics_never_adds_rows(spark):
     ]
 
     assert mapped(spark, *rows).count() == 2
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"cik": None},  # no company
+        {"filed": None},  # no filing date: decides which filing is newest
+        {"accepted": None},  # no acceptance time: breaks ties between filings
+    ],
+)
+def test_in_scope_filings_drops_a_filing_missing_a_key_field(spark, overrides):
+    fields = {"cik": "100", "filed": FILED, "accepted": ACCEPTED} | overrides
+    row = sub_row("A", fields["cik"], "10-K", filed=fields["filed"], accepted=fields["accepted"])
+
+    result = silver.in_scope_filings(spark.createDataFrame([row], SUB_SCHEMA))
+
+    assert result.count() == 0
+
+
+def test_in_scope_filings_keeps_a_filing_with_no_fiscal_year_end(spark):
+    row = sub_row("A", "100", "10-K", fye=None)
+
+    result = silver.in_scope_filings(spark.createDataFrame([row], SUB_SCHEMA)).collect()
+
+    assert [(r["adsh"], r["fye"]) for r in result] == [("A", None)]
+
+
+def test_keep_valid_period_shapes_matches_period_type_to_qtrs(spark):
+    rows = [("instant", 0), ("instant", 1), ("flow", 0), ("flow", 1), ("flow", 4)]
+    df = spark.createDataFrame(rows, "period_type string, qtrs int")
+
+    kept = {(r["period_type"], r["qtrs"]) for r in silver.keep_valid_period_shapes(df).collect()}
+
+    # A balance-sheet amount is a single date (0); an income or cash-flow amount is not.
+    assert kept == {("instant", 0), ("flow", 1), ("flow", 4)}
+
+
+# (fye, ddate, qtrs) -> (period_start, fiscal_quarter, fiscal_year, calendar_year, calendar_quarter)
+PERIOD_CASES = [
+    pytest.param(
+        "0630", date(2026, 3, 31), 1,
+        (date(2026, 1, 1), 3, 2026, 2026, 1),
+        id="microsoft-march-quarter",
+    ),
+    pytest.param(
+        "0930", date(2025, 12, 31), 1,
+        (date(2025, 10, 1), 1, 2026, 2025, 4),
+        id="apple-first-fiscal-quarter",
+    ),
+    pytest.param(
+        "0930", date(2025, 6, 30), 3,
+        (date(2024, 10, 1), 3, 2025, 2025, 2),
+        id="apple-nine-months-to-date",
+    ),
+    pytest.param(
+        "0930", date(2025, 9, 30), 4,
+        (date(2024, 10, 1), None, 2025, 2025, 3),
+        id="apple-full-year-has-no-fiscal-quarter",
+    ),
+    pytest.param(
+        "0630", date(2025, 6, 30), 0,
+        (None, 4, 2025, 2025, 2),
+        id="balance-sheet-at-year-end-has-no-start",
+    ),
+    pytest.param(
+        "1231", date(2025, 3, 31), 1,
+        (date(2025, 1, 1), 1, 2025, 2025, 1),
+        id="calendar-year-company",
+    ),
+    pytest.param(
+        "0131", date(2026, 4, 30), 1,
+        (date(2026, 2, 1), 1, 2027, 2026, 2),
+        id="january-year-end-fiscal-year-is-the-year-it-ends",
+    ),
+    pytest.param(
+        "0630", date(2025, 12, 31), 2,
+        (date(2025, 7, 1), 2, 2026, 2025, 4),
+        id="six-months-to-date",
+    ),
+    pytest.param(
+        None, date(2026, 3, 31), 1,
+        (date(2026, 1, 1), None, None, 2026, 1),
+        id="missing-fye-gives-no-fiscal-labels-but-calendar-ones-work",
+    ),
+]
+
+
+@pytest.mark.parametrize("fye, ddate, qtrs, expected", PERIOD_CASES)
+def test_add_periods_dates_and_labels(spark, fye, ddate, qtrs, expected):
+    df = spark.createDataFrame([(ddate, qtrs, fye)], "ddate date, qtrs int, fye string")
+
+    row = silver.add_periods(df).collect()[0]
+
+    actual = (
+        row["period_start"],
+        row["fiscal_quarter"],
+        row["fiscal_year"],
+        row["calendar_year"],
+        row["calendar_quarter"],
+    )
+    assert actual == expected
+
+
+def test_add_periods_renames_ddate_to_period_end(spark):
+    df = spark.createDataFrame([(date(2026, 3, 31), 1, "0630")], "ddate date, qtrs int, fye string")
+
+    result = silver.add_periods(df)
+
+    assert "ddate" not in result.columns
+    assert result.collect()[0]["period_end"] == date(2026, 3, 31)
